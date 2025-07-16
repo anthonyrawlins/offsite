@@ -1,0 +1,32 @@
+# Development planning files
+PROJECT_PLAN.md
+
+# Temporary files
+*.tmp
+*.temp
+
+# Log files
+*.log
+
+# Test files
+test-*
+*-test
+
+# Local configuration
+.env
+*.local
+
+# Working directories
+work/
+tmp/
+temp/
+
+# Age keys (security)
+*.age
+id_*
+
+# Backup chunks
+chunk-*
+*.zfs
+*.zfs.gz
+*.zfs.gz.age
