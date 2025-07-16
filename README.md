@@ -1,114 +1,159 @@
-# Offsite - ZFS Cloud Backup System
+# Offsite - Secure ZFS Cloud Backup
 
-A unified, production-ready ZFS backup system with chunked encryption and multi-provider support.
+**Never lose your data again.** Offsite provides military-grade encrypted, resumable ZFS backups to multiple cloud providers with a single command.
 
-## Core Scripts
+## Why Offsite?
 
-### 1. `offsite-backup`
-**Purpose**: Backup a single ZFS dataset to cloud storage
+### 🔒 **Security First**
+- **End-to-end encryption** using age cryptography
+- **Individual chunk encryption** - no single point of failure
+- **Zero-knowledge architecture** - your data is encrypted before it leaves your system
 
-**Usage**: `offsite-backup <dataset> [provider]`
+### 🚀 **Bulletproof Reliability**
+- **Resumable backups** - interrupted transfers continue where they left off
+- **Multi-provider support** - backup to multiple clouds simultaneously
+- **Incremental backups** - only transfer what changed
+- **Automatic retry** - handles network failures gracefully
 
-**Examples**:
+### 💾 **ZFS Native**
+- **Snapshot-based** - consistent, point-in-time backups
+- **Compression optimized** - efficient storage and transfer
+- **Restoration to any point** - restore specific snapshots or latest state
+- **Pool-level support** - backup entire ZFS pools or individual datasets
+
+### ⚡ **Dead Simple**
 ```bash
-offsite-backup tank/important/data
-offsite-backup tank/photos scaleway
-offsite-backup tank/documents backblaze
-offsite-backup tank/media amazonS3
+# Backup your data
+offsite --backup tank/important/data
+
+# Restore when needed  
+offsite --restore tank/important/data
 ```
 
-**Features**:
-- Automatic snapshot creation
-- Incremental backups when possible
-- Chunked uploads (1GB chunks)
-- Individual chunk encryption
-- Multi-provider support (backup to "all" by default)
-- Resumable backups (skips existing chunks)
-- Proper compression and encryption order
-- Automatic cleanup of old snapshots
+## Quick Start
 
-### 2. `offsite-restore`
-**Purpose**: Restore a ZFS dataset from cloud storage
-
-**Usage**: `offsite-restore <dataset[@backup]> [provider] [target_dataset]`
-
-**ZFS-style Examples**:
+### 1. Install
 ```bash
-offsite-restore tank/important/data
-offsite-restore tank/photos@latest-full backblaze
-offsite-restore tank/docs@full-auto-20250716-161605 scaleway tank/docs-test
+git clone https://github.com/anthonyrawlins/offsite.git
+cd offsite
+./setup.sh
 ```
 
-**ZFS Semantics**:
-- `dataset` - Restore full dataset state (latest backup)
-- `dataset@latest` - Same as above (ZFS semantics)
-- `dataset@latest-full` - Most recent full backup only
-- `dataset@backup-name` - Specific backup point in time
-
-**Features**:
-- Auto-provider detection
-- ZFS-style syntax for intuitive usage
-- Chunked downloads with reassembly
-- Individual chunk decryption
-- Stream reconstitution
-- Automatic ZFS receive
-
-## Processing Order
-
-The scripts implement the correct processing order:
-
-**Backup**: `ZFS send → Split → Gzip each chunk → Encrypt each chunk → Upload`
-**Restore**: `Download → Decrypt each chunk → Gunzip → Reconstitute → ZFS receive`
-
-## Configuration
-
-Scripts use configuration from: `$HOME/.config/offsite/config.env`
-
-Required configuration:
-- Age encryption keys
-- Rclone remote configurations
-- Provider settings
-
-## Legacy Scripts (Deprecated)
-
-The following scripts are deprecated and should not be used:
-- `zfs-backup-*.sh` (old naming)
-- `zfs-restore-*.sh` (old naming)  
-- `test-*.sh` (testing scripts)
-- `*-fixed.sh` (development iterations)
-
-## Key Improvements
-
-1. **Fixed age key newline issue** - Public key is properly trimmed
-2. **Correct processing order** - Split before compress/encrypt
-3. **Individual chunk encryption** - Each chunk is independently encrypted
-4. **Resumable backups** - Automatically skips existing chunks on restart
-5. **Proper error handling** - Comprehensive validation
-6. **Clean naming** - Consistent `offsite-*` naming convention
-
-## Resumable Backup Support
-
-The system supports resumable backups based on our proven ZFS send stream determinism:
-
-- **Automatic detection** - Checks for existing chunks before upload
-- **Safe resumption** - Same snapshot always produces identical streams
-- **Chunk boundary consistency** - Identical byte offsets guaranteed
-- **Atomic uploads** - RClone ensures existing chunks are complete
-- **Bandwidth savings** - Only uploads missing chunks on restart
-
-**Example Resume Scenario:**
+### 2. Configure
+Edit `~/.config/offsite/config.env` with your cloud storage credentials:
 ```bash
-# Initial backup interrupted after uploading 5 of 10 chunks
-offsite --backup tank/data
-
-# Resume automatically skips existing chunks 001-005
-offsite --backup tank/data  # Continues from chunk 006
+# Supports Backblaze B2, Scaleway, Amazon S3, Google Cloud, and more
+RCLONE_REMOTE="your-cloud-provider:bucket-name/backups"
 ```
 
-## Notes
+### 3. Backup
+```bash
+# Backup to all configured providers
+offsite --backup tank/photos
 
-- All scripts have been tested with real data
-- Backup/restore cycle proven to work end-to-end
-- Proper chunk boundaries and compression ratios
-- No 220-byte encryption artifacts
-- Stream integrity verified through diff comparison
+# Backup to specific provider
+offsite --backup tank/documents --provider backblaze
+
+# Create named snapshot
+offsite --backup tank/projects --as @before-upgrade
+```
+
+### 4. Restore
+```bash
+# Restore latest backup
+offsite --restore tank/photos
+
+# Restore to different location
+offsite --restore tank/photos --as tank/photos-recovered
+
+# Restore specific backup
+offsite --restore tank/projects@before-upgrade
+```
+
+## Key Features
+
+- **One-command operation** - backup and restore with a single command
+- **Automatic chunking** - splits large datasets into manageable 1GB chunks
+- **Smart resumption** - skips already uploaded chunks on restart
+- **Multi-cloud redundancy** - backup to multiple providers simultaneously
+- **Flexible scheduling** - perfect for cron jobs and automation
+- **Comprehensive logging** - detailed logs for monitoring and troubleshooting
+
+## Supported Cloud Providers
+
+Via rclone integration:
+- **Backblaze B2** - Cost-effective, reliable
+- **Amazon S3** - Industry standard
+- **Google Cloud Storage** - Fast and scalable
+- **Scaleway** - European data sovereignty
+- **Microsoft Azure** - Enterprise integration
+- **And 70+ others** - Any rclone-supported provider
+
+## Use Cases
+
+### Personal
+- **Home NAS backup** - Protect family photos, documents, media
+- **Development projects** - Version control for code and assets
+- **Digital archives** - Long-term storage of important data
+
+### Professional
+- **Server backup** - Automated daily backups of critical systems
+- **Compliance** - Meet data retention and recovery requirements
+- **Disaster recovery** - Geographic redundancy for business continuity
+
+## Advanced Usage
+
+### Automated Backups
+```bash
+# Daily backup at 2 AM
+echo "0 2 * * * offsite --backup tank/critical --as @daily-$(date +%Y%m%d)" | crontab -
+```
+
+### Multi-Provider Redundancy
+```bash
+# Backup to all providers simultaneously
+offsite --backup tank/important --provider all
+
+# Restore from any provider automatically
+offsite --restore tank/important --provider auto
+```
+
+### Disaster Recovery
+```bash
+# Full system restore
+offsite --restore tank                           # Restore entire pool
+offsite --restore tank/system --as tank/system-recovery
+```
+
+## Requirements
+
+- **ZFS filesystem** - OpenZFS on Linux, FreeBSD, or macOS
+- **rclone** - For cloud storage integration
+- **age** - For encryption (installed automatically)
+- **Bash 4.0+** - For script execution
+
+## Security Model
+
+1. **Local encryption** - Data encrypted before upload using age
+2. **Chunked security** - Each chunk independently encrypted
+3. **Zero-knowledge** - Cloud providers never see your data
+4. **Key management** - Your keys stay on your systems
+5. **Deterministic streams** - Consistent backups enable safe resumption
+
+## Contributing
+
+Found a bug? Have a feature request? Contributions welcome!
+
+1. Fork the repository
+2. Create your feature branch
+3. Submit a pull request
+
+## License
+
+GPL-3.0 - See LICENSE file for details.
+
+Built with ❤️ by [Anthony Rawlins](https://github.com/anthonyrawlins)
+
+---
+
+**Start protecting your data today. Your future self will thank you.**
