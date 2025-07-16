@@ -1,6 +1,6 @@
-# Offsite Backup Scripts
+# Offsite - ZFS Cloud Backup System
 
-This document describes the final, production-ready scripts for the offsite ZFS backup system.
+A unified, production-ready ZFS backup system with chunked encryption and multi-provider support.
 
 ## Core Scripts
 
