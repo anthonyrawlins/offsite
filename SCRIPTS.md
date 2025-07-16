@@ -23,6 +23,7 @@ offsite-backup tank/media amazonS3
 - Chunked uploads (1GB chunks)
 - Individual chunk encryption
 - Multi-provider support (backup to "all" by default)
+- Resumable backups (skips existing chunks)
 - Proper compression and encryption order
 - Automatic cleanup of old snapshots
 
@@ -81,8 +82,28 @@ The following scripts are deprecated and should not be used:
 1. **Fixed age key newline issue** - Public key is properly trimmed
 2. **Correct processing order** - Split before compress/encrypt
 3. **Individual chunk encryption** - Each chunk is independently encrypted
-4. **Proper error handling** - Comprehensive validation
-5. **Clean naming** - Consistent `offsite-*` naming convention
+4. **Resumable backups** - Automatically skips existing chunks on restart
+5. **Proper error handling** - Comprehensive validation
+6. **Clean naming** - Consistent `offsite-*` naming convention
+
+## Resumable Backup Support
+
+The system supports resumable backups based on our proven ZFS send stream determinism:
+
+- **Automatic detection** - Checks for existing chunks before upload
+- **Safe resumption** - Same snapshot always produces identical streams
+- **Chunk boundary consistency** - Identical byte offsets guaranteed
+- **Atomic uploads** - RClone ensures existing chunks are complete
+- **Bandwidth savings** - Only uploads missing chunks on restart
+
+**Example Resume Scenario:**
+```bash
+# Initial backup interrupted after uploading 5 of 10 chunks
+offsite --backup tank/data
+
+# Resume automatically skips existing chunks 001-005
+offsite --backup tank/data  # Continues from chunk 006
+```
 
 ## Notes
 
