@@ -9,10 +9,10 @@ if [[ $# -lt 1 ]] || [[ $# -gt 3 ]] || [[ "${1:-}" == "--help" ]] || [[ "${1:-}"
     echo "Usage: $0 <dataset[@backup]> [provider] [target_dataset]"
     echo ""
     echo "ZFS-style syntax for dataset and backup selection:"
-    echo "  dataset@latest       - Most recent backup (incremental if available)"
-    echo "  dataset@latest-full  - Most recent full backup"
-    echo "  dataset@backup-name  - Specific backup prefix"
-    echo "  dataset              - Defaults to @latest"
+    echo "  dataset              - Restore full dataset state (latest backup)"
+    echo "  dataset@latest       - Same as above (ZFS semantics)"
+    echo "  dataset@latest-full  - Most recent full backup only"
+    echo "  dataset@backup-name  - Specific backup point in time"
     echo ""
     echo "Providers:"
     echo "  auto       - Try all providers (Backblaze first) [default]"
@@ -49,6 +49,11 @@ TARGET_DATASET="$3"
 if [[ "$DATASET_ARG" =~ @ ]]; then
     SOURCE_DATASET="${DATASET_ARG%@*}"
     BACKUP_PREFIX="${DATASET_ARG#*@}"
+    
+    # ZFS semantics: dataset and dataset@latest are identical
+    if [[ "$BACKUP_PREFIX" == "latest" ]]; then
+        echo "Note: dataset@latest is the same as dataset (full dataset state)"
+    fi
 else
     SOURCE_DATASET="$DATASET_ARG"
     BACKUP_PREFIX="latest"

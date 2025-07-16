@@ -4,16 +4,17 @@ This document describes the final, production-ready scripts for the offsite ZFS 
 
 ## Core Scripts
 
-### 1. `offsite-backup-dataset.sh`
+### 1. `offsite-backup`
 **Purpose**: Backup a single ZFS dataset to cloud storage
 
-**Usage**: `./offsite-backup-dataset.sh <dataset> [provider]`
+**Usage**: `offsite-backup <dataset> [provider]`
 
 **Examples**:
 ```bash
-./offsite-backup-dataset.sh rust/containers
-./offsite-backup-dataset.sh rust/projects scaleway
-./offsite-backup-dataset.sh rust/family backblaze
+offsite-backup tank/important/data
+offsite-backup tank/photos scaleway
+offsite-backup tank/documents backblaze
+offsite-backup tank/media amazonS3
 ```
 
 **Features**:
@@ -21,23 +22,31 @@ This document describes the final, production-ready scripts for the offsite ZFS 
 - Incremental backups when possible
 - Chunked uploads (1GB chunks)
 - Individual chunk encryption
+- Multi-provider support (backup to "all" by default)
 - Proper compression and encryption order
 - Automatic cleanup of old snapshots
 
-### 2. `offsite-restore-dataset.sh`
+### 2. `offsite-restore`
 **Purpose**: Restore a ZFS dataset from cloud storage
 
-**Usage**: `./offsite-restore-dataset.sh <provider> <source_dataset> <backup_prefix> [target_dataset]`
+**Usage**: `offsite-restore <dataset[@backup]> [provider] [target_dataset]`
 
-**Examples**:
+**ZFS-style Examples**:
 ```bash
-./offsite-restore-dataset.sh backblaze rust/containers full-auto-20250716-161605
-./offsite-restore-dataset.sh scaleway rust/family incr-auto-20250717-104500 rust/family-test
-./offsite-restore-dataset.sh auto rust/projects full-auto-20250716-161605 tank/projects-backup
+offsite-restore tank/important/data
+offsite-restore tank/photos@latest-full backblaze
+offsite-restore tank/docs@full-auto-20250716-161605 scaleway tank/docs-test
 ```
+
+**ZFS Semantics**:
+- `dataset` - Restore full dataset state (latest backup)
+- `dataset@latest` - Same as above (ZFS semantics)
+- `dataset@latest-full` - Most recent full backup only
+- `dataset@backup-name` - Specific backup point in time
 
 **Features**:
 - Auto-provider detection
+- ZFS-style syntax for intuitive usage
 - Chunked downloads with reassembly
 - Individual chunk decryption
 - Stream reconstitution

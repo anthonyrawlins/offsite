@@ -121,15 +121,23 @@ fi
 
 # Install production scripts
 echo "[6/8] Installing backup scripts..."
-if [[ -f "offsite-backup-dataset.sh" && -f "offsite-restore-dataset.sh" ]]; then
-    sudo cp offsite-backup-dataset.sh /usr/local/bin/
-    sudo cp offsite-restore-dataset.sh /usr/local/bin/
-    sudo chmod +x /usr/local/bin/offsite-backup-dataset.sh
-    sudo chmod +x /usr/local/bin/offsite-restore-dataset.sh
-    echo "✓ Production scripts installed to /usr/local/bin/"
+if [[ -f "offsite" ]]; then
+    sudo cp offsite /usr/local/bin/
+    sudo chmod +x /usr/local/bin/offsite
+    echo "✓ Production script installed to /usr/local/bin/"
+    
+    # Check if /usr/local/bin is in PATH
+    if [[ ":$PATH:" != *":/usr/local/bin:"* ]]; then
+        echo "⚠ /usr/local/bin not in PATH"
+        echo "  Add to ~/.bashrc or ~/.zshrc:"
+        echo "  export PATH=\"/usr/local/bin:\$PATH\""
+    else
+        echo "✓ /usr/local/bin is in PATH"
+    fi
 else
-    echo "⚠ Production scripts not found in current directory"
+    echo "⚠ Production script not found in current directory"
     echo "  Make sure you're running this from the offsite project directory"
+    echo "  Expected file: offsite"
 fi
 
 # Setup ZFS permissions
@@ -172,12 +180,12 @@ echo ""
 if [[ -n "$USER_DATASETS" ]]; then
     echo "Your backup commands:"
     for dataset in $USER_DATASETS; do
-        echo "  /usr/local/bin/offsite-backup-dataset.sh $dataset"
+        echo "  offsite --backup $dataset"
     done
     echo ""
     echo "Automation (add to crontab for daily backups):"
     for dataset in $USER_DATASETS; do
-        echo "  0 2 * * * /usr/local/bin/offsite-backup-dataset.sh $dataset"
+        echo "  0 2 * * * offsite --backup $dataset --as @\$(date +%Y%m%d)"
     done
     echo ""
 fi
@@ -189,22 +197,23 @@ echo "   rclone config"
 if [[ -n "$USER_DATASETS" ]]; then
     echo "3. Test backup with your datasets:"
     for dataset in $USER_DATASETS; do
-        echo "   /usr/local/bin/offsite-backup-dataset.sh $dataset"
+        echo "   offsite --backup $dataset"
     done
 else
     echo "3. Test backup with:"
-    echo "   /usr/local/bin/offsite-backup-dataset.sh <your-dataset-name>"
+    echo "   offsite --backup <your-dataset-name>"
 fi
 echo ""
-echo "Production script usage:"
-echo "  Backup:  /usr/local/bin/offsite-backup-dataset.sh <dataset> [provider]"
-echo "  Restore: /usr/local/bin/offsite-restore-dataset.sh <dataset[@backup]> [provider] [target]"
+echo "Unified script usage:"
+echo "  Backup:  offsite --backup <dataset> [--as @snapshot] [--provider <name>]"
+echo "  Restore: offsite --restore <dataset[@backup]> [--as <target>] [--provider <name>]"
 echo ""
-echo "ZFS-style restore syntax:"
-echo "  dataset@latest       - Most recent backup (incremental if available)"
-echo "  dataset@latest-full  - Most recent full backup"
-echo "  dataset@backup-name  - Specific backup prefix"
-echo "  dataset              - Defaults to @latest"
+echo "Examples:"
+echo "  offsite --backup tank/data --as @today"
+echo "  offsite --restore tank/data                    # Restore to original name"
+echo "  offsite --restore tank/data --as tank/new-data # Restore to new name"
+echo "  offsite --backup tank/photos --provider scaleway"
+echo "  offsite --restore tank/photos@latest-full --as tank/photos-test"
 echo ""
 echo "⚠ IMPORTANT: Save your age private key securely!"
 echo "   Location: ~/.config/age/zfs-backup.txt"

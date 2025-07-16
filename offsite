@@ -1,0 +1,688 @@
+#!/bin/bash
+set -euo pipefail
+
+# Offsite - Unified ZFS Cloud Backup Tool
+# Handles both backup and restore operations with ZFS-style syntax
+
+# === USAGE ===
+show_help() {
+    cat << 'EOF'
+Usage: offsite [--backup|--restore] <dataset[@backup]> [options]
+
+OPERATIONS:
+  --backup, -b    Backup a ZFS dataset to cloud storage
+  --restore, -r   Restore a ZFS dataset from cloud storage
+
+ZFS-STYLE SYNTAX:
+  dataset               - For backup: create snapshot and backup
+                         For restore: restore full dataset state (latest backup)
+  dataset@snapshot      - For backup: backup specific snapshot
+                         For restore: restore to specific backup point
+  dataset@latest        - For restore: same as dataset (ZFS semantics)
+  dataset@latest-full   - For restore: most recent full backup only
+
+BACKUP OPTIONS:
+  --as @snapshot        Snapshot name to create (e.g., @today, @now, @custom-name)
+  --provider <name>     Provider to backup to (default: all)
+  --full               Force full backup (no incremental)
+
+RESTORE OPTIONS:
+  --as <dataset>        Target dataset name (default: restore to original name)
+  --provider <name>     Provider to restore from (default: auto-detect)
+
+COMMON OPTIONS:
+  --help, -h           Show this help
+  --version, -v        Show version information
+
+EXAMPLES:
+  # Backup operations
+  offsite --backup tank/important/data
+  offsite --backup tank/photos --as @today --provider scaleway
+  offsite --backup tank/docs --as @backup-$(date +%Y%m%d) --full
+  
+  # Restore operations
+  offsite --restore tank/important/data                 # Restore to original name
+  offsite --restore tank/photos@latest-full --as tank/photos-restored
+  offsite --restore tank/docs@full-auto-20250716-161605 --as tank/docs-test
+
+  # Short form (auto-detects operation from context)
+  offsite tank/important/data                    # Backup (default operation)
+  offsite tank/important/data@latest             # Restore (@ implies restore)
+
+PROVIDERS:
+  all         - Backup to all configured providers
+  auto        - Auto-detect provider (restore only)
+  backblaze   - Backblaze B2 (US)
+  scaleway    - Scaleway (EU)
+  <custom>    - Any configured provider (e.g., amazonS3)
+
+CONFIGURATION:
+  Config file: ~/.config/offsite/config.env
+  Setup: run setup-offsite to configure
+
+EOF
+}
+
+# === ARGUMENT PARSING ===
+OPERATION=""
+DATASET_ARG=""
+PROVIDER=""
+AS_ARG=""
+FORCE_FULL=false
+VERSION="1.0.0"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --backup|-b)
+            OPERATION="backup"
+            shift
+            ;;
+        --restore|-r)
+            OPERATION="restore"
+            shift
+            ;;
+        --provider)
+            PROVIDER="$2"
+            shift 2
+            ;;
+        --as)
+            AS_ARG="$2"
+            shift 2
+            ;;
+        --full)
+            FORCE_FULL=true
+            shift
+            ;;
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --version|-v)
+            echo "offsite version $VERSION"
+            exit 0
+            ;;
+        -*)
+            echo "ERROR: Unknown option $1"
+            show_help
+            exit 1
+            ;;
+        *)
+            if [[ -z "$DATASET_ARG" ]]; then
+                DATASET_ARG="$1"
+            else
+                echo "ERROR: Multiple datasets specified"
+                show_help
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Validate required arguments
+if [[ -z "$DATASET_ARG" ]]; then
+    echo "ERROR: No dataset specified"
+    show_help
+    exit 1
+fi
+
+# === AUTO-DETECT OPERATION ===
+if [[ -z "$OPERATION" ]]; then
+    if [[ "$DATASET_ARG" =~ @ ]]; then
+        OPERATION="restore"
+        echo "Auto-detected: restore operation (dataset@backup syntax)"
+    else
+        OPERATION="backup"
+        echo "Auto-detected: backup operation (default)"
+    fi
+fi
+
+# === LOAD CONFIG ===
+CONFIG_FILE="${OFFSITE_CONFIG:-$HOME/.config/offsite/config.env}"
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+else
+    echo "WARNING: Config file not found at $CONFIG_FILE"
+    echo "Using default values or environment variables"
+fi
+
+# === CONFIG WITH DEFAULTS ===
+AGE_PUBLIC_KEY_FILE="${AGE_PUBLIC_KEY_FILE:-$HOME/.config/age/zfs-backup.pub}"
+AGE_PRIVATE_KEY_FILE="${AGE_PRIVATE_KEY_FILE:-$HOME/.config/age/zfs-backup.txt}"
+SNAP_PREFIX="${ZFS_SNAP_PREFIX:-auto}"
+RETENTION_DAYS="${ZFS_RETENTION_DAYS:-14}"
+TEMP_DIR="${TEMP_DIR:-/tmp}"
+
+# === DISCOVER PROVIDERS ===
+declare -A PROVIDERS
+declare -A PROVIDER_NAMES
+
+# Built-in providers
+PROVIDERS[backblaze]="${RCLONE_REMOTE:-cloudremote:zfs-buckets-walnut-deepblack-cloud/zfs-backups}"
+PROVIDER_NAMES[backblaze]="Backblaze (US)"
+
+PROVIDERS[scaleway]="${SCALEWAY_REMOTE:-scaleway:zfs-buckets-acacia/zfs-backups}"
+PROVIDER_NAMES[scaleway]="Scaleway (EU)"
+
+# Discover custom providers from config (any variable ending with _REMOTE)
+if [[ -f "$CONFIG_FILE" ]]; then
+    while IFS='=' read -r key value; do
+        [[ "$key" =~ ^[A-Z_]+_REMOTE$ ]] && [[ "$key" != "RCLONE_REMOTE" ]] && [[ "$key" != "SCALEWAY_REMOTE" ]] && {
+            provider_name=$(echo "$key" | sed 's/_REMOTE$//' | tr '[:upper:]' '[:lower:]')
+            PROVIDERS[$provider_name]="$value"
+            PROVIDER_NAMES[$provider_name]="$provider_name"
+        }
+    done < <(grep -E '^[A-Z_]+_REMOTE=' "$CONFIG_FILE" | sed 's/^export //')
+fi
+
+# === VALIDATION ===
+command -v zfs >/dev/null || { echo "ERROR: zfs not installed"; exit 1; }
+command -v rclone >/dev/null || { echo "ERROR: rclone not installed"; exit 1; }
+command -v age >/dev/null || { echo "ERROR: age not installed"; exit 1; }
+
+# === DELEGATE TO OPERATION ===
+case "$OPERATION" in
+    backup)
+        # Source the backup functionality
+        source <(sed -n '/^# === BACKUP FUNCTIONS ===/,/^# === END BACKUP FUNCTIONS ===/p' "$0")
+        run_backup "$DATASET_ARG" "$PROVIDER" "$AS_ARG" "$FORCE_FULL"
+        ;;
+    restore)
+        # Source the restore functionality
+        source <(sed -n '/^# === RESTORE FUNCTIONS ===/,/^# === END RESTORE FUNCTIONS ===/p' "$0")
+        run_restore "$DATASET_ARG" "$PROVIDER" "$AS_ARG"
+        ;;
+    *)
+        echo "ERROR: Invalid operation: $OPERATION"
+        show_help
+        exit 1
+        ;;
+esac
+
+exit 0
+
+# === BACKUP FUNCTIONS ===
+
+run_backup() {
+    local dataset_arg="$1"
+    local provider="${2:-all}"
+    local as_arg="$3"
+    local force_full="$4"
+    
+    # Parse dataset@snapshot syntax or use --as
+    if [[ "$dataset_arg" =~ @ ]]; then
+        local dataset="${dataset_arg%@*}"
+        local snapshot_spec="${dataset_arg#*@}"
+        
+        if [[ -n "$as_arg" ]]; then
+            echo "ERROR: Cannot specify both dataset@snapshot and --as"
+            exit 1
+        fi
+        
+        # Handle special snapshot names
+        case "$snapshot_spec" in
+            today)
+                snapshot_spec="${SNAP_PREFIX}-$(date +%Y%m%d)"
+                ;;
+            now)
+                snapshot_spec="${SNAP_PREFIX}-$(date +%Y%m%d-%H%M%S)"
+                ;;
+        esac
+        
+        # Check if snapshot exists
+        if ! zfs list "${dataset}@${snapshot_spec}" >/dev/null 2>&1; then
+            echo "ERROR: Snapshot ${dataset}@${snapshot_spec} does not exist"
+            echo "Available snapshots:"
+            zfs list -t snapshot -o name "${dataset}" | head -10
+            exit 1
+        fi
+        
+        BACKUP_DATASET="$dataset"
+        BACKUP_SNAPSHOT="$snapshot_spec"
+        echo "Backing up existing snapshot: ${dataset}@${snapshot_spec}"
+    else
+        # Create new snapshot
+        BACKUP_DATASET="$dataset_arg"
+        
+        if [[ -n "$as_arg" ]]; then
+            # Use --as snapshot name
+            if [[ "$as_arg" =~ ^@ ]]; then
+                local snapshot_name="${as_arg#@}"
+                
+                # Handle special snapshot names
+                case "$snapshot_name" in
+                    today)
+                        BACKUP_SNAPSHOT="${SNAP_PREFIX}-$(date +%Y%m%d)"
+                        ;;
+                    now)
+                        BACKUP_SNAPSHOT="${SNAP_PREFIX}-$(date +%Y%m%d-%H%M%S)"
+                        ;;
+                    *)
+                        BACKUP_SNAPSHOT="$snapshot_name"
+                        ;;
+                esac
+            else
+                echo "ERROR: --as for backup must start with @ (e.g., --as @today)"
+                exit 1
+            fi
+        else
+            # Default snapshot name
+            BACKUP_SNAPSHOT="${SNAP_PREFIX}-$(date +%Y%m%d-%H%M%S)"
+        fi
+        
+        echo "Creating new snapshot: ${BACKUP_DATASET}@${BACKUP_SNAPSHOT}"
+        if ! zfs snapshot "${BACKUP_DATASET}@${BACKUP_SNAPSHOT}"; then
+            echo "ERROR: Failed to create snapshot"
+            exit 1
+        fi
+    fi
+    
+    # Validate dataset exists
+    if ! zfs list "$BACKUP_DATASET" >/dev/null 2>&1; then
+        echo "ERROR: Dataset '$BACKUP_DATASET' not found"
+        exit 1
+    fi
+    
+    # Validate age key
+    if [[ ! -f "$AGE_PUBLIC_KEY_FILE" ]]; then
+        echo "ERROR: Age public key not found at $AGE_PUBLIC_KEY_FILE"
+        exit 1
+    fi
+    
+    # Provider selection
+    if [[ "$provider" == "all" ]]; then
+        SELECTED_PROVIDERS=($(printf '%s\n' "${!PROVIDERS[@]}" | sort))
+        echo "Selected providers: ${SELECTED_PROVIDERS[*]}"
+    else
+        # Handle legacy aliases
+        case "$provider" in
+            bb) provider="backblaze" ;;
+            scw) provider="scaleway" ;;
+        esac
+        
+        if [[ -z "${PROVIDERS[$provider]:-}" ]]; then
+            echo "ERROR: Unknown provider '$provider'"
+            echo "Available providers: ${!PROVIDERS[*]}"
+            exit 1
+        fi
+        
+        SELECTED_PROVIDERS=("$provider")
+    fi
+    
+    # Test connections
+    echo "Testing connections to selected providers..."
+    for prov in "${SELECTED_PROVIDERS[@]}"; do
+        remote="${PROVIDERS[$prov]}"
+        echo "  Testing $prov (${PROVIDER_NAMES[$prov]})..."
+        if ! rclone lsd "${remote%:*}:" >/dev/null 2>&1; then
+            echo "ERROR: Cannot connect to $prov remote ${remote%:*}"
+            exit 1
+        fi
+        echo "  ✓ Connected to $prov"
+    done
+    
+    # Setup logging
+    DATASET_LOG_FILE="$HOME/offsite-backup-$(echo "$BACKUP_DATASET" | tr '/' '_')-$(date +%Y%m%d-%H%M%S).log"
+    exec > >(tee -a "$DATASET_LOG_FILE") 2>&1
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S') === Offsite Backup Started ==="
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Dataset: $BACKUP_DATASET"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Snapshot: $BACKUP_SNAPSHOT"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Providers: ${SELECTED_PROVIDERS[*]}"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Force full: $force_full"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Log file: $DATASET_LOG_FILE"
+    
+    # Backup to each provider
+    BACKUP_START=$(date +%s)
+    
+    for prov in "${SELECTED_PROVIDERS[@]}"; do
+        rclone_remote="${PROVIDERS[$prov]}"
+        provider_name="${PROVIDER_NAMES[$prov]}"
+        backup_single_provider "$BACKUP_DATASET" "$BACKUP_SNAPSHOT" "$prov" "$rclone_remote" "$provider_name" "$force_full"
+    done
+    
+    # Cleanup old snapshots
+    cleanup_old_snapshots "$BACKUP_DATASET"
+    
+    BACKUP_END=$(date +%s)
+    TOTAL_TIME=$((BACKUP_END - BACKUP_START))
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') === Offsite Backup Completed ==="
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Dataset: $BACKUP_DATASET"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Snapshot: $BACKUP_SNAPSHOT"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Providers: ${SELECTED_PROVIDERS[*]}"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Total time: ${TOTAL_TIME}s ($(($TOTAL_TIME / 60))m $(($TOTAL_TIME % 60))s)"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Log saved to: $DATASET_LOG_FILE"
+}
+
+backup_single_provider() {
+    local dataset="$1"
+    local snap="$2"
+    local provider="$3"
+    local rclone_remote="$4"
+    local provider_name="$5"
+    local force_full="$6"
+    local dataset_path="${dataset//\//_}"
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [+] Backing up ${dataset}@${snap} to $provider_name"
+    
+    # Detect previous snapshot for incremental backup
+    local prev_snap=""
+    if [[ "$force_full" == "false" ]]; then
+        prev_snap=$(zfs list -H -t snapshot -o name -s creation | grep "^${dataset}@${SNAP_PREFIX}-" | grep -v "@${snap}$" | tail -n1 | awk -F@ '{print $2}' || true)
+    fi
+    
+    # Create working directory
+    local work_dir="${TEMP_DIR}/offsite-backup-$(date +%s)"
+    mkdir -p "$work_dir"
+    cd "$work_dir"
+    
+    # Get trimmed age public key
+    local agekey=$(cat "$AGE_PUBLIC_KEY_FILE" | tr -d '\n')
+    
+    if [[ -n "$prev_snap" ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     Incremental backup from $prev_snap"
+        local prefix="incr"
+        local backup_prefix="${prefix}-${snap}"
+        
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     Creating incremental stream..."
+        zfs send -I "${dataset}@${prev_snap}" "${dataset}@${snap}" > stream.zfs
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     Full backup"
+        local prefix="full"
+        local backup_prefix="${prefix}-${snap}"
+        
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     Creating full stream..."
+        zfs send "${dataset}@${snap}" > stream.zfs
+    fi
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Stream created: $(ls -la stream.zfs | awk '{print $5}') bytes"
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Splitting into 1GB chunks..."
+    split -b 1G stream.zfs chunk- --numeric-suffixes=1 --suffix-length=3
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Chunks created: $(ls -la chunk-* | wc -l)"
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Compressing, encrypting and uploading chunks..."
+    for chunk in chunk-*; do
+        echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing $chunk..."
+        gzip < "$chunk" | age -r "$agekey" > "${backup_prefix}-x${chunk#chunk-}.zfs.gz.age"
+        rclone copy "${backup_prefix}-x${chunk#chunk-}.zfs.gz.age" "${rclone_remote}/${dataset_path}/"
+        echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded ${backup_prefix}-x${chunk#chunk-}.zfs.gz.age ($(ls -la ${backup_prefix}-x${chunk#chunk-}.zfs.gz.age | awk '{print $5}') bytes)"
+    done
+    
+    # Cleanup
+    cd /
+    rm -rf "$work_dir"
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Backup complete to $provider_name"
+}
+
+cleanup_old_snapshots() {
+    local dataset="$1"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [+] Cleaning up old snapshots for $dataset"
+    
+    zfs list -H -t snapshot -o name,creation -s creation | grep "^${dataset}@${SNAP_PREFIX}-" | while read snap creation; do
+        local snap_time=$(echo "$snap" | awk -F@ '{print $2}' | sed 's/.*-//')
+        local snap_date=$(date -d "${snap_time:0:8} ${snap_time:8:2}:${snap_time:10:2}:${snap_time:12:2}" +%s 2>/dev/null || continue)
+        local now=$(date +%s)
+        local age_days=$(( (now - snap_date) / 86400 ))
+        
+        if (( age_days > RETENTION_DAYS )); then
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     Destroying old snapshot $snap (${age_days} days old)"
+            zfs destroy "$snap"
+        fi
+    done
+}
+
+# === END BACKUP FUNCTIONS ===
+
+# === RESTORE FUNCTIONS ===
+
+run_restore() {
+    local dataset_arg="$1"
+    local provider="${2:-auto}"
+    local as_arg="$3"
+    
+    # Parse dataset@backup syntax
+    if [[ "$dataset_arg" =~ @ ]]; then
+        local source_dataset="${dataset_arg%@*}"
+        local backup_prefix="${dataset_arg#*@}"
+        
+        # ZFS semantics: dataset and dataset@latest are identical
+        if [[ "$backup_prefix" == "latest" ]]; then
+            echo "Note: dataset@latest is the same as dataset (full dataset state)"
+        fi
+    else
+        local source_dataset="$dataset_arg"
+        local backup_prefix="latest"
+    fi
+    
+    # Set target dataset from --as or use original name
+    local target_dataset
+    if [[ -n "$as_arg" ]]; then
+        target_dataset="$as_arg"
+    else
+        target_dataset="$source_dataset"
+    fi
+    
+    # Validate age key
+    if [[ ! -f "$AGE_PRIVATE_KEY_FILE" ]]; then
+        echo "ERROR: Age private key not found at $AGE_PRIVATE_KEY_FILE"
+        exit 1
+    fi
+    
+    # Provider selection
+    case "$provider" in
+        auto)
+            # Try all providers, prefer backblaze
+            echo "Auto mode: Testing all providers..."
+            local dataset_path="${source_dataset//\//_}"
+            local selected_remote=""
+            local provider_name=""
+            
+            # Try providers in order of preference
+            for prov in backblaze scaleway $(printf '%s\n' "${!PROVIDERS[@]}" | grep -v -E '^(backblaze|scaleway)$' | sort); do
+                local remote="${PROVIDERS[$prov]}"
+                if rclone lsf "${remote}/${dataset_path}/" 2>/dev/null | grep -q "^.*-x001.zfs.gz.age$"; then
+                    selected_remote="$remote"
+                    provider_name="${PROVIDER_NAMES[$prov]} - auto-selected"
+                    echo "Found backups on $prov"
+                    break
+                fi
+            done
+            
+            if [[ -z "$selected_remote" ]]; then
+                echo "ERROR: No backups found on any provider"
+                echo "Available providers: ${!PROVIDERS[*]}"
+                exit 1
+            fi
+            ;;
+        *)
+            # Handle legacy aliases
+            case "$provider" in
+                bb) provider="backblaze" ;;
+                scw) provider="scaleway" ;;
+            esac
+            
+            if [[ -z "${PROVIDERS[$provider]:-}" ]]; then
+                echo "ERROR: Unknown provider '$provider'"
+                echo "Available providers: ${!PROVIDERS[*]}"
+                exit 1
+            fi
+            
+            selected_remote="${PROVIDERS[$provider]}"
+            provider_name="${PROVIDER_NAMES[$provider]}"
+            ;;
+    esac
+    
+    # Setup variables
+    local dataset_path="${source_dataset//\//_}"
+    local remote_path="${selected_remote}/${dataset_path}"
+    
+    echo "=== Offsite Restore ==="
+    echo "Provider: $provider_name"
+    echo "Source dataset: $source_dataset"
+    echo "Target dataset: $target_dataset"
+    echo "Remote path: $remote_path"
+    echo ""
+    
+    # Backup selection
+    if [[ "$backup_prefix" == "latest" ]] || [[ "$backup_prefix" == "latest-full" ]]; then
+        echo "Discovering available backups..."
+        
+        # Get all backup prefixes for this dataset
+        local all_backups=($(rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^(full|incr)-.*-x[0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-x[0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u | sort -t- -k3,3 || true))
+        
+        if [[ ${#all_backups[@]} -eq 0 ]]; then
+            echo "ERROR: No backups found for dataset $source_dataset"
+            exit 1
+        fi
+        
+        if [[ "$backup_prefix" == "latest-full" ]]; then
+            # Find latest full backup
+            local selected_backup=""
+            for backup in "${all_backups[@]}"; do
+                if [[ "$backup" =~ ^full- ]]; then
+                    selected_backup="$backup"
+                fi
+            done
+            
+            if [[ -z "$selected_backup" ]]; then
+                echo "ERROR: No full backups found for dataset $source_dataset"
+                exit 1
+            fi
+            
+            backup_prefix="$selected_backup"
+            echo "Selected latest full backup: $backup_prefix"
+        else
+            # Find latest backup (incremental preferred)
+            backup_prefix="${all_backups[-1]}"
+            echo "Selected latest backup: $backup_prefix"
+        fi
+        
+        echo "Available backups for $source_dataset:"
+        printf '%s\n' "${all_backups[@]}" | tail -5
+        echo ""
+    else
+        echo "Using specified backup: $backup_prefix"
+    fi
+    
+    echo "Final backup selection: $backup_prefix"
+    echo ""
+    
+    # Discover chunks
+    echo "Discovering backup chunks..."
+    local chunk_files=($(rclone lsf "${remote_path}/" 2>/dev/null | grep "^${backup_prefix}-x[0-9][0-9][0-9].zfs.gz.age$" | sort))
+    
+    if [[ ${#chunk_files[@]} -eq 0 ]]; then
+        echo "ERROR: No chunks found for backup prefix: ${backup_prefix}"
+        echo ""
+        echo "Available backups for ${source_dataset}:"
+        rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^(full|incr)-.*-x[0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-x[0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || echo "No backups found"
+        exit 1
+    fi
+    
+    echo "Found ${#chunk_files[@]} chunks: ${chunk_files[0]} ... ${chunk_files[-1]}"
+    
+    # Connection test
+    echo "Testing connection to $provider_name..."
+    if ! rclone lsd "${selected_remote%:*}:" >/dev/null 2>&1; then
+        echo "ERROR: Cannot connect to $provider_name"
+        exit 1
+    fi
+    echo "✓ Connected to $provider_name"
+    
+    # Target dataset validation
+    if zfs list "$target_dataset" >/dev/null 2>&1; then
+        # Check if it's a pool or dataset
+        local target_type=$(zfs get -H -o value type "$target_dataset" 2>/dev/null)
+        
+        if [[ "$target_type" == "filesystem" ]]; then
+            echo "WARNING: Target dataset $target_dataset already exists"
+            read -p "Do you want to destroy and recreate it? (y/N): " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                echo "Restore cancelled"
+                echo "Suggestion: Use --as to specify a different target name"
+                exit 1
+            fi
+            echo "Destroying existing dataset..."
+            zfs destroy -r "$target_dataset"
+        else
+            echo "ERROR: Target $target_dataset exists but is not a filesystem"
+            echo "Type: $target_type"
+            echo "Use --as to specify a different target name"
+            exit 1
+        fi
+    else
+        # Check if parent exists for dataset creation
+        local parent_dataset=$(dirname "$target_dataset" | sed 's|/.*||' | head -1)
+        local dataset_path=$(echo "$target_dataset" | sed 's|^[^/]*/||')
+        
+        # If target contains '/', check parent exists
+        if [[ "$target_dataset" =~ / ]]; then
+            local parent_path=$(echo "$target_dataset" | sed 's|/[^/]*$||')
+            if ! zfs list "$parent_path" >/dev/null 2>&1; then
+                echo "ERROR: Parent dataset $parent_path does not exist"
+                echo "Create parent first or use --as with an existing parent"
+                exit 1
+            fi
+        fi
+    fi
+    
+    # Restore process
+    local work_dir="${TEMP_DIR}/offsite-restore-$(date +%s)"
+    mkdir -p "$work_dir"
+    cd "$work_dir"
+    
+    echo ""
+    echo "Starting restore process..."
+    echo "Working directory: $work_dir"
+    
+    # Download all chunks
+    echo "Step 1: Downloading chunks..."
+    for chunk_file in "${chunk_files[@]}"; do
+        echo "  Downloading: $chunk_file"
+        rclone copy "${remote_path}/${chunk_file}" ./
+    done
+    
+    # Decrypt and decompress chunks
+    echo "Step 2: Decrypting and decompressing chunks..."
+    for chunk_file in "${chunk_files[@]}"; do
+        echo "  Processing: $chunk_file"
+        # Extract the chunk number from filename
+        local chunk_num=$(echo "$chunk_file" | sed 's/.*-x\([0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
+        age -d -i "$AGE_PRIVATE_KEY_FILE" "$chunk_file" | gunzip > "chunk-${chunk_num}.restored"
+        echo "    ✓ Restored: chunk-${chunk_num}.restored"
+    done
+    
+    # Reconstitute stream
+    echo "Step 3: Reconstituting ZFS stream..."
+    cat chunk-*.restored > complete-stream.zfs
+    echo "Complete stream size: $(wc -c < complete-stream.zfs) bytes"
+    
+    # ZFS receive
+    echo "Step 4: Performing ZFS receive..."
+    zfs recv -F "$target_dataset" < complete-stream.zfs
+    
+    # Cleanup
+    cd /
+    rm -rf "$work_dir"
+    
+    echo ""
+    echo "✅ Restore complete!"
+    echo ""
+    echo "Source: $source_dataset ($backup_prefix)"
+    echo "Target: $target_dataset"
+    echo "Chunks processed: ${#chunk_files[@]}"
+    echo "Provider: $provider_name"
+    echo ""
+    echo "You can now:"
+    echo "  - Mount: zfs mount $target_dataset"
+    echo "  - List snapshots: zfs list -t snapshot -r $target_dataset"
+    echo "  - Access data at: $(zfs get -H -o value mountpoint $target_dataset 2>/dev/null || echo 'mount point')"
+}
+
+# === END RESTORE FUNCTIONS ===
