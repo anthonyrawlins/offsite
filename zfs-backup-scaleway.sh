@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# ZFS Cloud Backup Script with Environment Variable Support
+# ZFS Cloud Backup Script - Scaleway Only
+# Modified version for alternating backup schedule
 
 # === LOAD CONFIG ===
 CONFIG_FILE="${OFFSITE_CONFIG:-$HOME/.config/offsite/config.env}"
@@ -14,7 +15,7 @@ fi
 
 # === CONFIG WITH DEFAULTS ===
 POOL="${ZFS_POOL:-rust}"
-RCLONE_REMOTE="${RCLONE_REMOTE:-cloudremote:zfs-backups}"
+RCLONE_REMOTE="${SCALEWAY_REMOTE:-scaleway:zfs-buckets-acacia/zfs-backups}"
 AGE_PUBLIC_KEY_FILE="${AGE_PUBLIC_KEY_FILE:-$HOME/.config/age/zfs-backup.pub}"
 SNAP_PREFIX="${ZFS_SNAP_PREFIX:-auto}"
 RETENTION_DAYS="${ZFS_RETENTION_DAYS:-14}"
@@ -45,7 +46,7 @@ fi
 
 # === LOGGING ===
 exec > >(tee -a "$LOG_FILE") 2>&1
-echo "=== ZFS Backup Started: $(date) ==="
+echo "=== ZFS Backup Started (Scaleway): $(date) ==="
 
 # === FUNCTIONS ===
 
@@ -54,11 +55,6 @@ make_snapshot() {
     local snapname="${SNAP_PREFIX}-$(date +%Y%m%d-%H%M%S)"
     zfs snapshot "${dataset}@${snapname}"
     echo "$snapname"
-}
-
-get_latest_remote_snapshot() {
-    local dataset_path="$1"
-    rclone lsf "${RCLONE_REMOTE}/${dataset_path}/" 2>/dev/null | grep -E '^incr-|^full-' | sort | tail -n 1 || true
 }
 
 send_snapshot() {
@@ -115,7 +111,7 @@ cleanup_old_local_snaps() {
 
 echo "Configuration:"
 echo "  Pool: $POOL"
-echo "  Remote: $RCLONE_REMOTE"
+echo "  Remote: $RCLONE_REMOTE (Scaleway)"
 echo "  Retention: $RETENTION_DAYS days"
 echo "  Age key: $AGE_PUBLIC_KEY_FILE"
 echo ""
@@ -128,4 +124,4 @@ zfs list -H -o name -t filesystem -r "$POOL" | while read dataset; do
     echo ""
 done
 
-echo "=== ZFS Backup Completed: $(date) ==="
+echo "=== ZFS Backup Completed (Scaleway): $(date) ==="

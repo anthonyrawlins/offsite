@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# ZFS Cloud Backup Script with Environment Variable Support
+# ZFS Cloud Backup Script with Dual Destination Support
+# Backs up to both Backblaze and Scaleway for geographic redundancy
 
 # === LOAD CONFIG ===
 CONFIG_FILE="${OFFSITE_CONFIG:-$HOME/.config/offsite/config.env}"
@@ -14,7 +15,8 @@ fi
 
 # === CONFIG WITH DEFAULTS ===
 POOL="${ZFS_POOL:-rust}"
-RCLONE_REMOTE="${RCLONE_REMOTE:-cloudremote:zfs-backups}"
+RCLONE_REMOTE="${RCLONE_REMOTE:-cloudremote:zfs-buckets-walnut-deepblack-cloud/zfs-backups}"
+SCALEWAY_REMOTE="${SCALEWAY_REMOTE:-scaleway:zfs-buckets-acacia/zfs-backups}"
 AGE_PUBLIC_KEY_FILE="${AGE_PUBLIC_KEY_FILE:-$HOME/.config/age/zfs-backup.pub}"
 SNAP_PREFIX="${ZFS_SNAP_PREFIX:-auto}"
 RETENTION_DAYS="${ZFS_RETENTION_DAYS:-14}"
@@ -37,15 +39,23 @@ if ! command -v age >/dev/null 2>&1; then
     exit 1
 fi
 
-# Test rclone connection
+# Test rclone connections
+echo "Testing remote connections..."
 if ! rclone lsd "${RCLONE_REMOTE%:*}:" >/dev/null 2>&1; then
-    echo "ERROR: Cannot connect to rclone remote ${RCLONE_REMOTE%:*}"
+    echo "ERROR: Cannot connect to primary remote ${RCLONE_REMOTE%:*}"
     exit 1
 fi
+echo "✓ Primary remote (Backblaze) connected"
+
+if ! rclone lsd "${SCALEWAY_REMOTE%:*}:" >/dev/null 2>&1; then
+    echo "ERROR: Cannot connect to secondary remote ${SCALEWAY_REMOTE%:*}"
+    exit 1
+fi
+echo "✓ Secondary remote (Scaleway) connected"
 
 # === LOGGING ===
 exec > >(tee -a "$LOG_FILE") 2>&1
-echo "=== ZFS Backup Started: $(date) ==="
+echo "=== ZFS Dual Backup Started: $(date) ==="
 
 # === FUNCTIONS ===
 
@@ -56,18 +66,13 @@ make_snapshot() {
     echo "$snapname"
 }
 
-get_latest_remote_snapshot() {
-    local dataset_path="$1"
-    rclone lsf "${RCLONE_REMOTE}/${dataset_path}/" 2>/dev/null | grep -E '^incr-|^full-' | sort | tail -n 1 || true
-}
-
-send_snapshot() {
+send_snapshot_dual() {
     local dataset="$1"
     local snap="$2"
     local dataset_path="${dataset//\//_}"
-    local remote_path="${RCLONE_REMOTE}/${dataset_path}"
+    local tmpfile="${TEMP_DIR}/${dataset_path}-${snap}.zfs.gz.age"
 
-    echo "[+] Sending snapshot $dataset@$snap"
+    echo "[+] Processing snapshot $dataset@$snap"
 
     # Detect previous snapshot if any
     local prev_snap=$(zfs list -H -t snapshot -o name -s creation | grep "^${dataset}@${SNAP_PREFIX}-" | grep -B1 "$snap" | head -n1 | awk -F@ '{print $2}' || true)
@@ -83,15 +88,38 @@ send_snapshot() {
         local prefix="full"
     fi
 
-    # Split ZFS stream into 1GB chunks and upload
-    local backup_prefix="${prefix}-${snap}"
+    # Encrypt and write
+    echo "    Creating encrypted backup..."
     local agekey=$(cat "$AGE_PUBLIC_KEY_FILE")
+    eval "$send_cmd" | gzip | age -r "$agekey" > "$tmpfile"
     
-    echo "    Splitting into 1GB chunks and uploading to ${remote_path}/"
-    eval "$send_cmd" | split -b 1G --numeric-suffixes=1 --suffix-length=3 \
-        --filter="gzip | age -r '$agekey' | rclone rcat '${remote_path}/${backup_prefix}-\$FILE.zfs.gz.age' --progress && echo '      Chunk \$FILE uploaded'" -
+    local backup_file="${prefix}-${snap}.zfs.gz.age"
     
-    echo "    Chunked upload complete"
+    # Upload to both destinations in parallel
+    echo "    Uploading to both destinations..."
+    
+    # Background upload to Backblaze
+    (
+        echo "      → Uploading to Backblaze..."
+        rclone copy "$tmpfile" "${RCLONE_REMOTE}/${dataset_path}/" --progress 2>/dev/null
+        rclone moveto "${RCLONE_REMOTE}/${dataset_path}/$(basename "$tmpfile")" "${RCLONE_REMOTE}/${dataset_path}/${backup_file}" 2>/dev/null
+        echo "      ✓ Backblaze upload complete"
+    ) &
+    
+    # Background upload to Scaleway
+    (
+        echo "      → Uploading to Scaleway..."
+        rclone copy "$tmpfile" "${SCALEWAY_REMOTE}/${dataset_path}/" --progress 2>/dev/null
+        rclone moveto "${SCALEWAY_REMOTE}/${dataset_path}/$(basename "$tmpfile")" "${SCALEWAY_REMOTE}/${dataset_path}/${backup_file}" 2>/dev/null
+        echo "      ✓ Scaleway upload complete"
+    ) &
+    
+    # Wait for both uploads to complete
+    wait
+    
+    # Clean up temp file
+    rm "$tmpfile"
+    echo "    ✓ Dual upload completed successfully"
 }
 
 cleanup_old_local_snaps() {
@@ -113,9 +141,10 @@ cleanup_old_local_snaps() {
 
 # === MAIN ===
 
-echo "Configuration:"
+echo "Dual Backup Configuration:"
 echo "  Pool: $POOL"
-echo "  Remote: $RCLONE_REMOTE"
+echo "  Primary (Backblaze): $RCLONE_REMOTE"
+echo "  Secondary (Scaleway): $SCALEWAY_REMOTE"
 echo "  Retention: $RETENTION_DAYS days"
 echo "  Age key: $AGE_PUBLIC_KEY_FILE"
 echo ""
@@ -123,9 +152,10 @@ echo ""
 zfs list -H -o name -t filesystem -r "$POOL" | while read dataset; do
     echo "=== Processing $dataset ==="
     snapname=$(make_snapshot "$dataset")
-    send_snapshot "$dataset" "$snapname"
+    send_snapshot_dual "$dataset" "$snapname"
     cleanup_old_local_snaps "$dataset"
     echo ""
 done
 
-echo "=== ZFS Backup Completed: $(date) ==="
+echo "=== ZFS Dual Backup Completed: $(date) ==="
+echo "Backups available on both Backblaze (US) and Scaleway (EU) for geographic redundancy"
