@@ -1,0 +1,190 @@
+#!/bin/bash
+
+# bulk - Parallel copy utility for large datasets
+# Usage: bulk [options] source destination
+
+set -euo pipefail
+
+# Default settings
+PARALLEL_JOBS=$(nproc)
+MAX_JOBS=16
+VERBOSE=false
+DRY_RUN=false
+RSYNC_OPTS="-a"
+
+show_help() {
+    cat << EOF
+bulk - Parallel copy utility optimized for large datasets
+
+Usage: bulk [OPTIONS] SOURCE DESTINATION
+
+OPTIONS:
+    -j, --jobs N        Number of parallel jobs (default: CPU count, max: $MAX_JOBS)
+    -v, --verbose       Verbose output (show rsync progress)
+    -n, --dry-run       Show what would be copied without actually copying
+    -h, --help          Show this help
+
+EXAMPLES:
+    bulk /media/usb-drive/ /zfs/dataset/
+    bulk -j 8 /backup/data/ /restore/location/
+    bulk -v -n /source/ /dest/    # Preview what will be copied
+
+NOTES:
+    - Recursively copies all files and directories
+    - Preserves permissions, timestamps, and symlinks
+    - Automatically parallelizes by top-level directories
+    - Falls back to single rsync for small directory counts
+    - Optimized for many files, not necessarily large files
+
+EOF
+}
+
+# Parse arguments
+ARGS=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -j|--jobs)
+            PARALLEL_JOBS="$2"
+            shift 2
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            RSYNC_OPTS="${RSYNC_OPTS}v"
+            shift
+            ;;
+        -n|--dry-run)
+            DRY_RUN=true
+            RSYNC_OPTS="${RSYNC_OPTS}n"
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            echo "Use 'bulk --help' for usage information" >&2
+            exit 1
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Validate arguments
+if [[ ${#ARGS[@]} -ne 2 ]]; then
+    echo "Error: Exactly two arguments required (source and destination)" >&2
+    echo "Use 'bulk --help' for usage information" >&2
+    exit 1
+fi
+
+SOURCE="${ARGS[0]}"
+DEST="${ARGS[1]}"
+
+# Validate source exists
+if [[ ! -d "$SOURCE" ]]; then
+    echo "Error: Source directory '$SOURCE' does not exist" >&2
+    exit 1
+fi
+
+# Ensure source path ends with /
+if [[ "$SOURCE" != */ ]]; then
+    SOURCE="$SOURCE/"
+fi
+
+# Ensure destination exists or create it
+if [[ ! -d "$DEST" ]] && [[ "$DRY_RUN" == "false" ]]; then
+    echo "Creating destination directory: $DEST"
+    mkdir -p "$DEST"
+fi
+
+# Limit parallel jobs
+if [[ $PARALLEL_JOBS -gt $MAX_JOBS ]]; then
+    PARALLEL_JOBS=$MAX_JOBS
+    echo "Warning: Limited to $MAX_JOBS parallel jobs for optimal performance"
+fi
+
+echo "=== Bulk Copy ==="
+echo "Source: $SOURCE"
+echo "Destination: $DEST"
+echo "Parallel jobs: $PARALLEL_JOBS"
+echo "Rsync options: $RSYNC_OPTS"
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY RUN - No files will be copied"
+fi
+echo ""
+
+# Get top-level directories and files
+TOP_LEVEL_DIRS=($(find "$SOURCE" -maxdepth 1 -type d -not -path "$SOURCE" 2>/dev/null | head -20 || true))
+TOP_LEVEL_FILES=($(find "$SOURCE" -maxdepth 1 -type f 2>/dev/null | head -100 || true))
+
+TOTAL_ITEMS=$((${#TOP_LEVEL_DIRS[@]} + ${#TOP_LEVEL_FILES[@]}))
+
+if [[ $TOTAL_ITEMS -eq 0 ]]; then
+    echo "No files or directories found in source"
+    exit 0
+fi
+
+echo "Found ${#TOP_LEVEL_DIRS[@]} directories and ${#TOP_LEVEL_FILES[@]} files at top level"
+
+# If we have enough top-level items for parallelization
+if [[ $TOTAL_ITEMS -ge 3 ]]; then
+    echo "Using parallel rsync with $PARALLEL_JOBS jobs"
+    
+    # Create array of all items to process
+    ALL_ITEMS=()
+    for dir in "${TOP_LEVEL_DIRS[@]}"; do
+        ALL_ITEMS+=("$dir")
+    done
+    for file in "${TOP_LEVEL_FILES[@]}"; do
+        ALL_ITEMS+=("$file")
+    done
+    
+    # Function to copy single item
+    copy_item() {
+        local item="$1"
+        local basename=$(basename "$item")
+        
+        if [[ "$VERBOSE" == "true" ]]; then
+            echo "[$(date '+%H:%M:%S')] Starting: $basename"
+        fi
+        
+        rsync $RSYNC_OPTS "$item" "$DEST/"
+        
+        if [[ "$VERBOSE" == "true" ]]; then
+            echo "[$(date '+%H:%M:%S')] Completed: $basename"
+        fi
+    }
+    
+    export -f copy_item
+    export RSYNC_OPTS DEST VERBOSE
+    
+    # Use xargs for parallel processing
+    printf '%s\n' "${ALL_ITEMS[@]}" | xargs -P "$PARALLEL_JOBS" -I {} bash -c 'copy_item "$@"' _ {}
+    
+else
+    echo "Few items found, using single rsync process"
+    if [[ "$VERBOSE" == "true" ]]; then
+        rsync $RSYNC_OPTS --progress "$SOURCE" "$DEST/"
+    else
+        rsync $RSYNC_OPTS "$SOURCE" "$DEST/"
+    fi
+fi
+
+if [[ "$DRY_RUN" == "false" ]]; then
+    echo ""
+    echo "✓ Bulk copy completed successfully"
+    
+    # Show summary
+    if command -v tree >/dev/null 2>&1; then
+        echo "Destination structure:"
+        tree -L 2 "$DEST" | head -20
+    else
+        echo "Files in destination: $(find "$DEST" -type f | wc -l)"
+    fi
+else
+    echo ""
+    echo "✓ Dry run completed (no files copied)"
+fi

@@ -1,10 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-# ZFS Single Dataset Restore Script with Chunked Backup Support
+# Offsite Restore - Single Dataset
+# Downloads and restores encrypted chunks from cloud storage
 
 # === USAGE ===
-show_usage() {
+if [[ $# -lt 3 ]] || [[ $# -gt 4 ]]; then
     echo "Usage: $0 <provider> <source_dataset> <backup_prefix> [target_dataset]"
     echo ""
     echo "Providers:"
@@ -14,30 +15,21 @@ show_usage() {
     echo ""
     echo "Arguments:"
     echo "  source_dataset - Original dataset name (e.g., rust/containers)"
-    echo "  backup_prefix  - Backup prefix (e.g., full-20250716-104500)"
+    echo "  backup_prefix  - Backup prefix (e.g., full-auto-20250716-161605)"
     echo "  target_dataset - Optional: New dataset name (default: source_dataset-restored)"
     echo ""
     echo "Examples:"
-    echo "  $0 backblaze rust/containers full-20250716-104500"
+    echo "  $0 backblaze rust/containers full-auto-20250716-161605"
     echo "    # Restores to rust/containers-restored"
     echo ""
-    echo "  $0 scaleway rust/family incr-20250717-104500 rust/family-test"
+    echo "  $0 scaleway rust/family incr-auto-20250717-104500 rust/family-test"
     echo "    # Restores to rust/family-test"
     echo ""
-    echo "  $0 auto rust/projects full-20250716-104500 tank/projects-backup"
+    echo "  $0 auto rust/projects full-auto-20250716-161605 tank/projects-backup"
     echo "    # Auto-detects provider, restores to tank/projects-backup"
-    echo ""
-    echo "List available backups:"
-    echo "  rclone ls cloudremote:zfs-buckets-walnut-deepblack-cloud/zfs-backups/rust_containers/"
-    echo "  rclone ls scaleway:zfs-buckets-acacia/zfs-backups/rust_containers/"
-}
-
-if [[ $# -lt 3 ]] || [[ $# -gt 4 ]]; then
-    show_usage
     exit 1
 fi
 
-# === INPUTS ===
 PROVIDER="$1"
 SOURCE_DATASET="$2"
 BACKUP_PREFIX="$3"
@@ -59,25 +51,10 @@ SCALEWAY_REMOTE="${SCALEWAY_REMOTE:-scaleway:zfs-buckets-acacia/zfs-backups}"
 TEMP_DIR="${TEMP_DIR:-/tmp}"
 
 # === VALIDATION ===
-if [[ ! -f "$AGE_PRIVATE_KEY_FILE" ]]; then
-    echo "ERROR: Age private key not found at $AGE_PRIVATE_KEY_FILE"
-    exit 1
-fi
-
-if ! command -v rclone >/dev/null 2>&1; then
-    echo "ERROR: rclone not installed"
-    exit 1
-fi
-
-if ! command -v age >/dev/null 2>&1; then
-    echo "ERROR: age not installed"
-    exit 1
-fi
-
-if ! command -v zfs >/dev/null 2>&1; then
-    echo "ERROR: zfs not installed"
-    exit 1
-fi
+[[ -f "$AGE_PRIVATE_KEY_FILE" ]] || { echo "ERROR: Age private key not found at $AGE_PRIVATE_KEY_FILE"; exit 1; }
+command -v rclone >/dev/null || { echo "ERROR: rclone not installed"; exit 1; }
+command -v age >/dev/null || { echo "ERROR: age not installed"; exit 1; }
+command -v zfs >/dev/null || { echo "ERROR: zfs not installed"; exit 1; }
 
 # === PROVIDER SELECTION ===
 case "$PROVIDER" in
@@ -115,7 +92,7 @@ esac
 DATASET_PATH="${SOURCE_DATASET//\//_}"
 REMOTE_PATH="${SELECTED_REMOTE}/${DATASET_PATH}"
 
-echo "=== ZFS Dataset Restore ==="
+echo "=== Offsite Restore ==="
 echo "Provider: $PROVIDER_NAME"
 echo "Source dataset: $SOURCE_DATASET"
 echo "Backup prefix: $BACKUP_PREFIX"
@@ -132,16 +109,6 @@ if [[ ${#CHUNK_FILES[@]} -eq 0 ]]; then
     echo ""
     echo "Available backups for ${SOURCE_DATASET} on $PROVIDER_NAME:"
     rclone lsf "${REMOTE_PATH}/" 2>/dev/null | grep -E '^(full|incr)-.*-x[0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-x[0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || echo "No backups found"
-    
-    if [[ "$PROVIDER" != "auto" ]]; then
-        echo ""
-        echo "Try the other provider:"
-        if [[ "$PROVIDER" == "backblaze" ]]; then
-            echo "  $0 scaleway $SOURCE_DATASET $BACKUP_PREFIX $TARGET_DATASET"
-        else
-            echo "  $0 backblaze $SOURCE_DATASET $BACKUP_PREFIX $TARGET_DATASET"
-        fi
-    fi
     exit 1
 fi
 
@@ -169,89 +136,53 @@ if zfs list "$TARGET_DATASET" >/dev/null 2>&1; then
 fi
 
 # === RESTORE PROCESS ===
-RESTORE_FIFO="${TEMP_DIR}/zfs-restore-$(date +%s).fifo"
-mkfifo "$RESTORE_FIFO"
+WORK_DIR="${TEMP_DIR}/offsite-restore-$(date +%s)"
+mkdir -p "$WORK_DIR"
+cd "$WORK_DIR"
 
 echo ""
-echo "Starting chunked restore process..."
-echo "This will restore $SOURCE_DATASET to $TARGET_DATASET"
+echo "Starting restore process..."
+echo "Working directory: $WORK_DIR"
 
-# Start ZFS receive in background
-(
-    echo "ZFS receive process started for $TARGET_DATASET"
-    age -d -i "$AGE_PRIVATE_KEY_FILE" < "$RESTORE_FIFO" | gunzip | zfs recv -F "$TARGET_DATASET"
-    echo "ZFS receive process completed"
-) &
-ZFS_PID=$!
-
-# Download and stream chunks in order
-chunk_num=1
-total_chunks=${#CHUNK_FILES[@]}
-
+# Download all chunks
+echo "Step 1: Downloading chunks..."
 for chunk_file in "${CHUNK_FILES[@]}"; do
-    echo "[$chunk_num/$total_chunks] Downloading and streaming: $chunk_file"
-    
-    # Try primary provider first
-    if rclone cat "${REMOTE_PATH}/${chunk_file}" >> "$RESTORE_FIFO" 2>/dev/null; then
-        echo "      ✓ Downloaded from $PROVIDER_NAME"
-    else
-        echo "      ⚠ Failed from $PROVIDER_NAME, trying alternate provider..."
-        
-        # Determine alternate provider
-        if [[ "$PROVIDER_NAME" == *"Backblaze"* ]]; then
-            ALT_REMOTE="$SCALEWAY_REMOTE"
-            ALT_NAME="Scaleway"
-        else
-            ALT_REMOTE="$RCLONE_REMOTE"
-            ALT_NAME="Backblaze"
-        fi
-        
-        ALT_PATH="${ALT_REMOTE}/${DATASET_PATH}"
-        
-        # Try alternate provider
-        if rclone cat "${ALT_PATH}/${chunk_file}" >> "$RESTORE_FIFO" 2>/dev/null; then
-            echo "      ✓ Downloaded from $ALT_NAME (failover success)"
-        else
-            echo "ERROR: Chunk $chunk_file failed on both providers"
-            kill $ZFS_PID 2>/dev/null || true
-            rm -f "$RESTORE_FIFO"
-            exit 1
-        fi
-    fi
-    
-    chunk_num=$((chunk_num + 1))
+    echo "  Downloading: $chunk_file"
+    rclone copy "${REMOTE_PATH}/${chunk_file}" ./
 done
 
-# Close the FIFO and wait for ZFS receive to complete
-exec 3>"$RESTORE_FIFO"
-exec 3>&-
-wait $ZFS_PID
-ZFS_EXIT_CODE=$?
+# Decrypt and decompress chunks
+echo "Step 2: Decrypting and decompressing chunks..."
+for chunk_file in "${CHUNK_FILES[@]}"; do
+    echo "  Processing: $chunk_file"
+    # Extract the chunk number from filename (e.g., full-auto-20250716-161605-x001.zfs.gz.age -> 001)
+    chunk_num=$(echo "$chunk_file" | sed 's/.*-x\([0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
+    age -d -i "$AGE_PRIVATE_KEY_FILE" "$chunk_file" | gunzip > "chunk-${chunk_num}.restored"
+    echo "    ✓ Restored: chunk-${chunk_num}.restored"
+done
+
+# Reconstitute stream
+echo "Step 3: Reconstituting ZFS stream..."
+cat chunk-*.restored > complete-stream.zfs
+echo "Complete stream size: $(wc -c < complete-stream.zfs) bytes"
+
+# ZFS receive
+echo "Step 4: Performing ZFS receive..."
+zfs recv -F "$TARGET_DATASET" < complete-stream.zfs
 
 # Cleanup
-rm -f "$RESTORE_FIFO"
+cd /
+rm -rf "$WORK_DIR"
 
-if [[ $ZFS_EXIT_CODE -eq 0 ]]; then
-    echo ""
-    echo "✓ Dataset restore complete from $PROVIDER_NAME!"
-    echo ""
-    echo "Source: $SOURCE_DATASET ($BACKUP_PREFIX)"
-    echo "Target: $TARGET_DATASET"
-    echo "Chunks processed: ${total_chunks}"
-    echo "Provider: $PROVIDER_NAME"
-    echo ""
-    echo "You can now:"
-    echo "  - Mount: zfs mount $TARGET_DATASET"
-    echo "  - List snapshots: zfs list -t snapshot -r $TARGET_DATASET"
-    echo "  - Access data at: $(zfs get -H -o value mountpoint $TARGET_DATASET 2>/dev/null || echo 'mount point')"
-    echo ""
-    echo "To make this the active dataset, you can:"
-    echo "  1. Stop services using the original dataset"
-    echo "  2. Rename: zfs rename $SOURCE_DATASET ${SOURCE_DATASET}-old"
-    echo "  3. Rename: zfs rename $TARGET_DATASET $SOURCE_DATASET"
-    echo "  4. Restart services"
-else
-    echo ""
-    echo "ERROR: ZFS receive failed with exit code: $ZFS_EXIT_CODE"
-    exit 1
-fi
+echo ""
+echo "✅ Restore complete!"
+echo ""
+echo "Source: $SOURCE_DATASET ($BACKUP_PREFIX)"
+echo "Target: $TARGET_DATASET"
+echo "Chunks processed: ${#CHUNK_FILES[@]}"
+echo "Provider: $PROVIDER_NAME"
+echo ""
+echo "You can now:"
+echo "  - Mount: zfs mount $TARGET_DATASET"
+echo "  - List snapshots: zfs list -t snapshot -r $TARGET_DATASET"
+echo "  - Access data at: $(zfs get -H -o value mountpoint $TARGET_DATASET 2>/dev/null || echo 'mount point')"
