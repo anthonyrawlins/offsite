@@ -327,6 +327,31 @@ run_backup() {
     # Simple logging without process substitution
     touch "$DATASET_LOG_FILE"
     
+    # Create lockfile to prevent concurrent backups of same dataset
+    LOCK_FILE="$HOME/.offsite-$(echo "$BACKUP_DATASET" | tr '/' '_').lock"
+    
+    # Check for existing lock
+    if [[ -f "$LOCK_FILE" ]]; then
+        local existing_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+        if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+            echo "ERROR: Another offsite backup is already running for dataset $BACKUP_DATASET (PID $existing_pid)"
+            echo "If you're sure no other backup is running, remove: $LOCK_FILE"
+            exit 1
+        else
+            echo "INFO: Removing stale lock file (PID $existing_pid no longer exists)"
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    
+    # Create lock file with our PID
+    echo $$ > "$LOCK_FILE"
+    
+    # Setup cleanup trap to remove lock file
+    cleanup_lock() {
+        rm -f "$LOCK_FILE"
+    }
+    trap cleanup_lock EXIT
+    
     # Background-safe logging function
     log_message() {
         local message="$1"
