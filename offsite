@@ -23,9 +23,7 @@ ZFS-STYLE SYNTAX:
   dataset@latest-full   - For restore: most recent full backup only
 
 BACKUP OPTIONS:
-  --as @snapshot        Snapshot name to create (e.g., @today, @now, @custom-name)
   --provider <name>     Provider to backup to (default: all)
-  --full               Force full backup (no incremental)
 
 RESTORE OPTIONS:
   --as <dataset>        Target dataset name (default: restore to original name)
@@ -38,8 +36,8 @@ COMMON OPTIONS:
 EXAMPLES:
   # Backup operations
   offsite --backup tank/important/data
-  offsite --backup tank/photos --as @today --provider scaleway
-  offsite --backup tank/docs --as @backup-$(date +%Y%m%d) --full
+  offsite --backup tank/photos@now --provider scaleway
+  offsite --backup tank/docs@backup-$(date +%Y%m%d)
   
   # Restore operations
   offsite --restore tank/important/data                 # Restore to original name
@@ -69,8 +67,7 @@ OPERATION=""
 DATASET_ARG=""
 PROVIDER=""
 AS_ARG=""
-FORCE_FULL=false
-VERSION="1.0.0"
+VERSION="2.0"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -88,12 +85,14 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --as)
-            AS_ARG="$2"
-            shift 2
-            ;;
-        --full)
-            FORCE_FULL=true
-            shift
+            # Only allow --as for restore operations
+            if [[ "$OPERATION" == "restore" ]]; then
+                AS_ARG="$2"
+                shift 2
+            else
+                echo "ERROR: --as flag only valid for restore operations"
+                exit 1
+            fi
             ;;
         --help|-h)
             show_help
@@ -189,7 +188,7 @@ case "$OPERATION" in
     backup)
         # Source the backup functionality
         source <(sed -n '/^# === BACKUP FUNCTIONS ===/,/^# === END BACKUP FUNCTIONS ===/p' "$0")
-        run_backup "$DATASET_ARG" "$PROVIDER" "$AS_ARG" "$FORCE_FULL"
+        run_backup "$DATASET_ARG" "$PROVIDER"
         ;;
     restore)
         # Source the restore functionality
@@ -210,8 +209,6 @@ exit 0
 run_backup() {
     local dataset_arg="$1"
     local provider="${2:-all}"
-    local as_arg="$3"
-    local force_full="$4"
     
     # Parse dataset@snapshot syntax or use --as
     if [[ "$dataset_arg" =~ @ ]]; then
@@ -233,48 +230,26 @@ run_backup() {
                 ;;
         esac
         
-        # Check if snapshot exists
+        # Check if snapshot exists, if not create it
         if ! zfs list "${dataset}@${snapshot_spec}" >/dev/null 2>&1; then
-            echo "ERROR: Snapshot ${dataset}@${snapshot_spec} does not exist"
-            echo "Available snapshots:"
-            zfs list -t snapshot -o name "${dataset}" | head -10
-            exit 1
+            echo "Creating snapshot: ${dataset}@${snapshot_spec}"
+            if ! zfs snapshot "${dataset}@${snapshot_spec}"; then
+                echo "ERROR: Failed to create snapshot"
+                exit 1
+            fi
         fi
         
         BACKUP_DATASET="$dataset"
         BACKUP_SNAPSHOT="$snapshot_spec"
-        echo "Backing up existing snapshot: ${dataset}@${snapshot_spec}"
+        echo "Backing up snapshot: ${dataset}@${snapshot_spec}"
     else
         # Create new snapshot
         BACKUP_DATASET="$dataset_arg"
         
-        if [[ -n "$as_arg" ]]; then
-            # Use --as snapshot name
-            if [[ "$as_arg" =~ ^@ ]]; then
-                local snapshot_name="${as_arg#@}"
-                
-                # Handle special snapshot names
-                case "$snapshot_name" in
-                    today)
-                        BACKUP_SNAPSHOT="${SNAP_PREFIX}-$(date +%Y%m%d)"
-                        ;;
-                    now)
-                        BACKUP_SNAPSHOT="${SNAP_PREFIX}-$(date +%Y%m%d-%H%M%S)"
-                        ;;
-                    *)
-                        BACKUP_SNAPSHOT="$snapshot_name"
-                        ;;
-                esac
-            else
-                echo "ERROR: --as for backup must start with @ (e.g., --as @today)"
-                exit 1
-            fi
-        else
-            # Default snapshot name
-            BACKUP_SNAPSHOT="${SNAP_PREFIX}-$(date +%Y%m%d-%H%M%S)"
-        fi
+        # Default snapshot name
+        BACKUP_SNAPSHOT="${SNAP_PREFIX}-$(date +%Y%m%d-%H%M%S)"
         
-        echo "Creating new snapshot: ${BACKUP_DATASET}@${BACKUP_SNAPSHOT}"
+        echo "Creating snapshot: ${BACKUP_DATASET}@${BACKUP_SNAPSHOT}"
         if ! zfs snapshot "${BACKUP_DATASET}@${BACKUP_SNAPSHOT}"; then
             echo "ERROR: Failed to create snapshot"
             exit 1
@@ -446,16 +421,12 @@ backup_single_provider() {
     local provider="$3"
     local rclone_remote="$4"
     local provider_name="$5"
-    local force_full="$6"
     local dataset_path="${dataset//\//_}"
     
     echo "$(date '+%Y-%m-%d %H:%M:%S') [+] Backing up ${dataset}@${snap} to $provider_name"
     
-    # Detect previous snapshot for incremental backup
-    local prev_snap=""
-    if [[ "$force_full" == "false" ]]; then
-        prev_snap=$(zfs list -H -t snapshot -o name -s creation | grep "^${dataset}@${SNAP_PREFIX}-" | grep -v "@${snap}$" | tail -n1 | awk -F@ '{print $2}' || true)
-    fi
+    # Always perform full backups - simpler and more reliable
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Performing full backup"
     
     # No working directory needed for streaming backup!
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Using streaming backup - no temp files required"
@@ -463,19 +434,12 @@ backup_single_provider() {
     # Get trimmed age public key
     local agekey=$(cat "$AGE_PUBLIC_KEY_FILE" | tr -d '\n')
     
-    if [[ -n "$prev_snap" ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Incremental backup from $prev_snap"
-        local prefix="incr"
-        local backup_prefix="${prefix}-${snap}"
-        
-        stream_zfs_to_cloud "${dataset}@${prev_snap}" "${dataset}@${snap}" "$backup_prefix" "$rclone_remote" "$dataset_path" "$agekey" "incremental"
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Full backup"
-        local prefix="full"
-        local backup_prefix="${prefix}-${snap}"
-        
-        stream_zfs_to_cloud "" "${dataset}@${snap}" "$backup_prefix" "$rclone_remote" "$dataset_path" "$agekey" "full"
-    fi
+    # Always do full backup
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Full backup"
+    local prefix="full"
+    local backup_prefix="${prefix}-${snap}"
+    
+    stream_zfs_to_cloud "" "${dataset}@${snap}" "$backup_prefix" "$rclone_remote" "$dataset_path" "$agekey" "full"
     
     # No cleanup needed - streaming backup used no temp files!
     
@@ -505,13 +469,8 @@ stream_zfs_to_cloud() {
         echo "$(date '+%Y-%m-%d %H:%M:%S')     No existing shards found - starting fresh backup"
     fi
     
-    # Create the zfs send command
-    local zfs_cmd
-    if [[ "$backup_type" == "incremental" && -n "$prev_snap" ]]; then
-        zfs_cmd="zfs send -I \"$prev_snap\" \"$current_snap\""
-    else
-        zfs_cmd="zfs send \"$current_snap\""
-    fi
+    # Create the zfs send command - always full
+    local zfs_cmd="zfs send \"$current_snap\""
     
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Streaming: $zfs_cmd"
     
@@ -520,20 +479,8 @@ stream_zfs_to_cloud() {
     local dataset_size_bytes=0
     local estimated_shards=0
     
-    # Get dataset size for progress estimation
-    if [[ "$backup_type" == "incremental" && -n "$prev_snap" ]]; then
-        # For incremental: estimate based on changes since last snapshot
-        # This is approximate - actual size depends on data changes
-        dataset_size_bytes=$(zfs get -H -o value -p written "$current_snap" 2>/dev/null | grep -v '^-$' || echo "0")
-        if [[ "$dataset_size_bytes" == "0" || "$dataset_size_bytes" == "-" ]]; then
-            # Fallback: estimate as 10% of full dataset for incremental
-            local full_size=$(zfs get -H -o value -p used "${current_snap%@*}" 2>/dev/null || echo "1073741824")
-            dataset_size_bytes=$((full_size / 10))
-        fi
-    else
-        # For full backup: get dataset used size
-        dataset_size_bytes=$(zfs get -H -o value -p used "${current_snap%@*}" 2>/dev/null || echo "1073741824")
-    fi
+    # Get dataset size for progress estimation (always full backup)
+    dataset_size_bytes=$(zfs get -H -o value -p used "${current_snap%@*}" 2>/dev/null || echo "1073741824")
     
     # Calculate estimated shards based on SHARD_SIZE
     # Convert SHARD_SIZE to bytes (support K, M, G suffixes)
