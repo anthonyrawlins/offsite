@@ -31,15 +31,19 @@
 
 ### 🎯 **Dead Simple**
 ```bash
-# Backup your data
-offsite --backup tank/important/data
+# Recommended: Snapshot first, then backup
+zfs snapshot tank/important/data@backup-$(date +%Y%m%d)
+offsite --backup tank/important/data@backup-$(date +%Y%m%d)
+
+# Or let offsite create the snapshot for you
+offsite --backup tank/important/data --as @backup-$(date +%Y%m%d)
 
 # Background backup with progress tracking
-offsite --backup tank/photos &
+offsite --backup tank/photos@daily-backup &
 tail -f ~/offsite-backup-tank_photos-*.log
 
 # Restore when needed  
-offsite --restore tank/important/data
+offsite --restore tank/important/data@backup-20250117
 ```
 
 ## Quick Start
@@ -60,13 +64,15 @@ RCLONE_REMOTE="your-cloud-provider:bucket-name/backups"
 
 ### 3. Backup
 ```bash
-# Backup to all configured providers
-offsite --backup tank/photos
+# BEST PRACTICE: Create snapshot first, then backup
+zfs snapshot tank/photos@daily-$(date +%Y%m%d)
+offsite --backup tank/photos@daily-$(date +%Y%m%d)
 
 # Backup to specific provider
-offsite --backup tank/documents --provider backblaze
+zfs snapshot tank/documents@backup-$(date +%Y%m%d)
+offsite --backup tank/documents@backup-$(date +%Y%m%d) --provider backblaze
 
-# Create named snapshot
+# Let offsite create the snapshot for you
 offsite --backup tank/projects --as @before-upgrade
 ```
 
@@ -142,11 +148,11 @@ tail -f ~/offsite-backup-*.log
 ### 🕐 **Automated Backups**
 ```bash
 # Daily backup at 2 AM (background-safe)
-echo "0 2 * * * offsite --backup tank/critical --as @daily-$(date +%Y%m%d)" | crontab -
+echo "0 2 * * * offsite --backup tank/critical --as @daily-\$(date +%Y%m%d)" | crontab -
 
 # Multiple daily backups to different providers
-echo "0 2 * * * offsite --backup tank/data --provider backblaze" | crontab -
-echo "0 3 * * * offsite --backup tank/data --provider scaleway" | crontab -
+echo "0 2 * * * offsite --backup tank/data --as @backup-\$(date +%Y%m%d) --provider backblaze" | crontab -
+echo "0 3 * * * offsite --backup tank/data --as @backup-\$(date +%Y%m%d) --provider scaleway" | crontab -
 ```
 
 ### 🌐 **Multi-Provider Redundancy**
