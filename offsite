@@ -496,57 +496,98 @@ stream_zfs_to_cloud() {
     } &
     local split_pid=$!
     
-    # Process chunks as they appear
+    # Process chunks as they appear - wait for complete chunks
+    local processed_chunks=()
     while true; do
-        # Wait for a chunk file to appear or split to finish
-        if ls "$pipe_dir"/chunk-* >/dev/null 2>&1; then
+        # Get list of chunk files
+        local current_chunks=($(ls "$pipe_dir"/chunk-* 2>/dev/null | sort))
+        
+        # Process any new complete chunks
+        for chunk_file in "${current_chunks[@]}"; do
+            [[ -f "$chunk_file" ]] || continue
+            
+            # Skip if already processed
+            local chunk_basename=$(basename "$chunk_file")
+            if printf '%s\n' "${processed_chunks[@]}" | grep -q "^${chunk_basename}$"; then
+                continue
+            fi
+            
+            # Wait for chunk to be completely written by checking if it's still growing
+            local initial_size=$(stat -c%s "$chunk_file" 2>/dev/null || echo "0")
+            sleep 0.1
+            local final_size=$(stat -c%s "$chunk_file" 2>/dev/null || echo "0")
+            
+            # If file is still growing, skip for now
+            if [[ $initial_size -ne $final_size ]]; then
+                continue
+            fi
+            
+            # If split is still running and this isn't the last chunk, wait a bit more
+            if kill -0 $split_pid 2>/dev/null; then
+                # Check if there might be more chunks coming
+                local next_chunk_num=$(printf "%03d" $((10#${chunk_basename#chunk-} + 1)))
+                if [[ ! -f "$pipe_dir/chunk-$next_chunk_num" ]]; then
+                    # Wait a bit more to ensure chunk is complete
+                    sleep 0.2
+                    local verify_size=$(stat -c%s "$chunk_file" 2>/dev/null || echo "0")
+                    if [[ $final_size -ne $verify_size ]]; then
+                        continue  # Still growing
+                    fi
+                fi
+            fi
+            
+            # Now process the complete chunk
+            local output_file="${backup_prefix}-x${chunk_basename#chunk-}.zfs.gz.age"
+            
+            # Check if chunk already exists (resumable backup)
+            if printf '%s\n' "${existing_chunks[@]}" | grep -q "^${output_file}$"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       ✓ Chunk $chunk_num of ~$estimated_chunks already exists: $output_file"
+            else
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing chunk $chunk_num of ~$estimated_chunks..."
+                
+                # Stream chunk: compress -> encrypt -> upload
+                if gzip < "$chunk_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
+                else
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
+                    kill $split_pid 2>/dev/null || true
+                    rm -rf "$pipe_dir"
+                    return 1
+                fi
+            fi
+            
+            # Mark as processed and remove file
+            processed_chunks+=("$chunk_basename")
+            rm -f "$chunk_file"
+            ((chunk_num++))
+            ((total_chunks++))
+        done
+        
+        # Check if split is done
+        if ! kill -0 $split_pid 2>/dev/null; then
+            # Process any remaining chunks
             for chunk_file in "$pipe_dir"/chunk-*; do
                 [[ -f "$chunk_file" ]] || continue
                 
-                local output_file="${backup_prefix}-x${chunk_file##*/chunk-}.zfs.gz.age"
-                
-                # Check if chunk already exists (resumable backup)
-                if printf '%s\n' "${existing_chunks[@]}" | grep -q "^${output_file}$"; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       ✓ Chunk $chunk_num of ~$estimated_chunks already exists: $output_file"
-                else
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing chunk $chunk_num of ~$estimated_chunks..."
-                    
-                    # Stream chunk: compress -> encrypt -> upload
-                    if gzip < "$chunk_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
-                    else
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
-                        kill $split_pid 2>/dev/null || true
-                        rm -rf "$pipe_dir"
-                        return 1
-                    fi
+                local chunk_basename=$(basename "$chunk_file")
+                if printf '%s\n' "${processed_chunks[@]}" | grep -q "^${chunk_basename}$"; then
+                    continue
                 fi
                 
-                # Remove processed chunk immediately
+                local output_file="${backup_prefix}-x${chunk_basename#chunk-}.zfs.gz.age"
+                
+                if ! printf '%s\n' "${existing_chunks[@]}" | grep -q "^${output_file}$"; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing final chunk $chunk_num of ~$estimated_chunks..."
+                    gzip < "$chunk_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"
+                    ((total_chunks++))
+                fi
                 rm -f "$chunk_file"
-                ((chunk_num++))
-                ((total_chunks++))
             done
-        else
-            # Check if split is done
-            if ! kill -0 $split_pid 2>/dev/null; then
-                # Process any remaining chunks
-                for chunk_file in "$pipe_dir"/chunk-*; do
-                    [[ -f "$chunk_file" ]] || continue
-                    
-                    local output_file="${backup_prefix}-x${chunk_file##*/chunk-}.zfs.gz.age"
-                    
-                    if ! printf '%s\n' "${existing_chunks[@]}" | grep -q "^${output_file}$"; then
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing final chunk $chunk_num of ~$estimated_chunks..."
-                        gzip < "$chunk_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"
-                        ((total_chunks++))
-                    fi
-                    rm -f "$chunk_file"
-                done
-                break
-            fi
-            sleep 0.1
+            break
         fi
+        
+        # Small delay before checking again
+        sleep 0.2
     done
     
     # Cleanup
