@@ -14,6 +14,8 @@
 - **Multi-provider support** - backup to multiple clouds simultaneously
 - **Incremental backups** - only transfer what changed
 - **Automatic retry** - handles network failures gracefully
+- **Background execution** - safe to run in background with full logging
+- **Multi-terminal support** - run multiple backups concurrently with conflict prevention
 
 ### 💾 **ZFS Native**
 - **Snapshot-based** - consistent, point-in-time backups
@@ -21,10 +23,20 @@
 - **Restoration to any point** - restore specific snapshots or latest state
 - **Pool-level support** - backup entire ZFS pools or individual datasets
 
-### ⚡ **Dead Simple**
+### ⚡ **Revolutionary Streaming Technology**
+- **99.9% less temp space** - backup 100TB using only ~1GB temp storage
+- **Real-time progress tracking** - see "Processing chunk 3 of ~15..."
+- **Direct streaming pipeline** - `zfs send | chunk | compress | encrypt | upload`
+- **No disk bottlenecks** - never runs out of space during backup
+
+### 🎯 **Dead Simple**
 ```bash
 # Backup your data
 offsite --backup tank/important/data
+
+# Background backup with progress tracking
+offsite --backup tank/photos &
+tail -f ~/offsite-backup-tank_photos-*.log
 
 # Restore when needed  
 offsite --restore tank/important/data
@@ -72,12 +84,24 @@ offsite --restore tank/projects@before-upgrade
 
 ## Key Features
 
+### 🎯 **Core Functionality**
 - **One-command operation** - backup and restore with a single command
-- **Automatic chunking** - splits large datasets into manageable 1GB chunks
+- **Streaming architecture** - no large temp files required
+- **Real-time progress** - see chunk progress and size estimates
 - **Smart resumption** - skips already uploaded chunks on restart
 - **Multi-cloud redundancy** - backup to multiple providers simultaneously
-- **Flexible scheduling** - perfect for cron jobs and automation
+
+### 🔄 **Concurrent Operations**
+- **Background execution** - safe to run with `&` operator
+- **Multi-terminal support** - run multiple backups simultaneously
+- **Automatic conflict prevention** - dataset-level locking
+- **Post-reboot recovery** - handles stale locks intelligently
+
+### 📊 **Monitoring & Logging**
+- **Progress estimation** - shows "Processing chunk 3 of ~15..."
+- **Size estimation** - displays GB/MB estimates before starting
 - **Comprehensive logging** - detailed logs for monitoring and troubleshooting
+- **Background-safe logging** - automatic log file creation for `&` jobs
 
 ## Supported Cloud Providers
 
@@ -103,16 +127,37 @@ Via rclone integration:
 
 ## Advanced Usage
 
-### Automated Backups
+### 🔄 **Concurrent Operations**
 ```bash
-# Daily backup at 2 AM
-echo "0 2 * * * offsite --backup tank/critical --as @daily-$(date +%Y%m%d)" | crontab -
+# Multiple datasets simultaneously
+offsite --backup tank/photos --provider backblaze &
+offsite --backup tank/projects --provider scaleway &
+offsite --backup rust/hobby &
+
+# Monitor all background jobs
+jobs
+tail -f ~/offsite-backup-*.log
 ```
 
-### Multi-Provider Redundancy
+### 🕐 **Automated Backups**
+```bash
+# Daily backup at 2 AM (background-safe)
+echo "0 2 * * * offsite --backup tank/critical --as @daily-$(date +%Y%m%d)" | crontab -
+
+# Multiple daily backups to different providers
+echo "0 2 * * * offsite --backup tank/data --provider backblaze" | crontab -
+echo "0 3 * * * offsite --backup tank/data --provider scaleway" | crontab -
+```
+
+### 🌐 **Multi-Provider Redundancy**
 ```bash
 # Backup to all providers simultaneously
 offsite --backup tank/important --provider all
+
+# Concurrent multi-provider backup
+offsite --backup tank/critical --provider backblaze &
+offsite --backup tank/critical --provider scaleway &
+offsite --backup tank/critical --provider amazonS3 &
 
 # Restore from any provider automatically
 offsite --restore tank/important --provider auto
@@ -139,6 +184,38 @@ offsite --restore tank/system --as tank/system-recovery
 3. **Zero-knowledge** - Cloud providers never see your data
 4. **Key management** - Your keys stay on your systems
 5. **Deterministic streams** - Consistent backups enable safe resumption
+
+## ❓ Frequently Asked Questions
+
+**Q: Can I run backups in the background?**
+A: Yes! Fully background-safe with automatic logging:
+```bash
+offsite --backup tank/data &
+tail -f ~/offsite-backup-tank_data-*.log
+```
+
+**Q: Can I run multiple backups simultaneously?**
+A: Yes! Multi-terminal support with automatic conflict prevention:
+```bash
+offsite --backup tank/photos &    # ✅ Safe
+offsite --backup tank/projects &  # ✅ Safe  
+offsite --backup tank/photos &    # ❌ Blocked automatically
+```
+
+**Q: How much disk space do I need?**
+A: Only ~1GB! Streaming approach eliminates large temp files:
+- **Before**: 100TB backup required 200TB+ temp space
+- **Now**: 100TB backup requires ~1GB temp space
+
+**Q: What happens if my system reboots during backup?**
+A: Automatic recovery! Stale locks are detected and cleaned up:
+```bash
+# After reboot
+offsite --backup tank/data
+# Output: INFO: Removing old stale lock file (120 minutes old - likely from reboot)
+```
+
+**For more questions, see [FAQ.md](FAQ.md)**
 
 ## Contributing
 
