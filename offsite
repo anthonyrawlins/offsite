@@ -585,7 +585,35 @@ run_restore() {
         printf '%s\n' "${all_backups[@]}" | tail -5
         echo ""
     else
-        echo "Using specified backup: $backup_prefix"
+        # User specified a specific backup - need to find the actual backup prefix
+        echo "Searching for backup matching: $backup_prefix"
+        
+        # Get all backup prefixes for this dataset
+        local all_backups=($(rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^(full|incr)-.*-x[0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-x[0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u | sort -t- -k3,3 || true))
+        
+        if [[ ${#all_backups[@]} -eq 0 ]]; then
+            echo "ERROR: No backups found for dataset $source_dataset"
+            exit 1
+        fi
+        
+        # Look for backup that ends with the specified snapshot name
+        local found_backup=""
+        for backup in "${all_backups[@]}"; do
+            if [[ "$backup" == "full-${backup_prefix}" ]] || [[ "$backup" == "incr-${backup_prefix}" ]]; then
+                found_backup="$backup"
+                break
+            fi
+        done
+        
+        if [[ -z "$found_backup" ]]; then
+            echo "ERROR: No backup found matching snapshot: $backup_prefix"
+            echo "Available backups:"
+            printf '%s\n' "${all_backups[@]}"
+            exit 1
+        fi
+        
+        backup_prefix="$found_backup"
+        echo "Found matching backup: $backup_prefix"
     fi
     
     echo "Final backup selection: $backup_prefix"

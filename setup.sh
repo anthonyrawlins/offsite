@@ -97,7 +97,7 @@ AGE_PUBLIC_KEY_FILE="$HOME/.config/age/zfs-backup.pub"
 AGE_PRIVATE_KEY_FILE="$HOME/.config/age/zfs-backup.txt"
 
 # === Backup Paths ===
-TEMP_DIR="/tmp"
+TEMP_DIR="/rust/offsite-temp"
 EOF
     
     chmod 600 ~/.config/offsite/config.env
@@ -145,12 +145,28 @@ echo "[7/8] Setting up ZFS permissions..."
 CURRENT_USER=$(whoami)
 if [[ "$CURRENT_USER" != "root" ]]; then
     echo "Setting ZFS permissions for user: $CURRENT_USER"
-    # Grant necessary ZFS permissions for backup operations
-    sudo zfs allow -u "$CURRENT_USER" snapshot,send,mount,hold,destroy,create,receive || {
-        echo "⚠ Could not set ZFS permissions automatically"
-        echo "  Run manually: sudo zfs allow -u $CURRENT_USER snapshot,send,mount,hold,destroy,create,receive <pool_name>"
-    }
-    echo "✓ ZFS permissions configured"
+    
+    # Detect ZFS pools
+    if command -v zpool >/dev/null 2>&1; then
+        POOLS=$(zpool list -H -o name 2>/dev/null || true)
+        if [[ -n "$POOLS" ]]; then
+            echo "Detected ZFS pools: $POOLS"
+            for pool in $POOLS; do
+                echo "  Configuring permissions for pool: $pool"
+                sudo zfs allow -u "$CURRENT_USER" snapshot,send,mount,hold,destroy,create,receive "$pool" || {
+                    echo "  ⚠ Could not set permissions for pool: $pool"
+                    echo "    Run manually: sudo zfs allow -u $CURRENT_USER snapshot,send,mount,hold,destroy,create,receive $pool"
+                }
+            done
+            echo "✓ ZFS permissions configured for all pools"
+        else
+            echo "⚠ No ZFS pools found"
+            echo "  Run manually after creating pools: sudo zfs allow -u $CURRENT_USER snapshot,send,mount,hold,destroy,create,receive <pool_name>"
+        fi
+    else
+        echo "⚠ ZFS not available"
+        echo "  Install zfsutils-linux first"
+    fi
 else
     echo "✓ Running as root, ZFS permissions not needed"
 fi
@@ -172,7 +188,14 @@ echo ""
 echo "[Optional] Dataset Configuration:"
 echo "Which ZFS datasets would you like to set up for backup?"
 echo "Available datasets:"
-zfs list -H -o name -t filesystem | head -10
+if command -v zfs >/dev/null 2>&1; then
+    zfs list -H -o name -t filesystem 2>/dev/null | head -10 || {
+        echo "  (Unable to list datasets - may need ZFS permissions)"
+        echo "  Common examples: tank/data, tank/home, rust/projects"
+    }
+else
+    echo "  (ZFS not available)"
+fi
 echo ""
 read -p "Enter datasets to backup (space-separated, or press Enter to skip): " USER_DATASETS
 echo ""
