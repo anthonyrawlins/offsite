@@ -333,12 +333,33 @@ run_backup() {
     # Check for existing lock
     if [[ -f "$LOCK_FILE" ]]; then
         local existing_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
-        if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
-            echo "ERROR: Another offsite backup is already running for dataset $BACKUP_DATASET (PID $existing_pid)"
-            echo "If you're sure no other backup is running, remove: $LOCK_FILE"
-            exit 1
+        
+        if [[ -z "$existing_pid" ]]; then
+            echo "INFO: Removing corrupted lock file (no PID found)"
+            rm -f "$LOCK_FILE"
+        elif kill -0 "$existing_pid" 2>/dev/null; then
+            # Process is still running - check if it's actually offsite
+            local process_cmd=$(ps -p "$existing_pid" -o comm= 2>/dev/null || echo "")
+            if [[ "$process_cmd" == *"offsite"* ]] || [[ "$process_cmd" == *"bash"* ]]; then
+                echo "ERROR: Another offsite backup is already running for dataset $BACKUP_DATASET (PID $existing_pid)"
+                echo "Process: $process_cmd"
+                echo "If you're sure no other backup is running, remove: $LOCK_FILE"
+                exit 1
+            else
+                echo "INFO: Removing stale lock file (PID $existing_pid is not offsite process: $process_cmd)"
+                rm -f "$LOCK_FILE"
+            fi
         else
-            echo "INFO: Removing stale lock file (PID $existing_pid no longer exists)"
+            # PID doesn't exist - could be from reboot or killed process
+            local lock_age=$(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo "0")
+            local current_time=$(date +%s)
+            local age_minutes=$(( (current_time - lock_age) / 60 ))
+            
+            if [[ $age_minutes -gt 60 ]]; then
+                echo "INFO: Removing old stale lock file (PID $existing_pid, ${age_minutes} minutes old - likely from reboot)"
+            else
+                echo "INFO: Removing stale lock file (PID $existing_pid no longer exists)"
+            fi
             rm -f "$LOCK_FILE"
         fi
     fi
