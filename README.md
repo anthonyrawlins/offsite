@@ -6,7 +6,7 @@
 
 ### 🔒 **Security First**
 - **End-to-end encryption** using age cryptography
-- **Individual chunk encryption** - no single point of failure
+- **Individual shard encryption** - no single point of failure
 - **Zero-knowledge architecture** - your data is encrypted before it leaves your system
 
 ### 🚀 **Bulletproof Reliability**
@@ -25,8 +25,8 @@
 
 ### ⚡ **Revolutionary Streaming Technology**
 - **99.9% less temp space** - backup 100TB using only ~1GB temp storage
-- **Real-time progress tracking** - see "Processing chunk 3 of ~15..."
-- **Direct streaming pipeline** - `zfs send | chunk | compress | encrypt | upload`
+- **Real-time progress tracking** - see "Processing shard 3 of ~15..."
+- **Direct streaming pipeline** - `zfs send | shard | compress | encrypt | upload`
 - **No disk bottlenecks** - never runs out of space during backup
 
 ### 🎯 **Dead Simple**
@@ -93,8 +93,8 @@ offsite --restore tank/projects@before-upgrade
 ### 🎯 **Core Functionality**
 - **One-command operation** - backup and restore with a single command
 - **Streaming architecture** - no large temp files required
-- **Real-time progress** - see chunk progress and size estimates
-- **Smart resumption** - skips already uploaded chunks on restart
+- **Real-time progress** - see shard progress and size estimates
+- **Smart resumption** - skips already uploaded shards on restart
 - **Multi-cloud redundancy** - backup to multiple providers simultaneously
 
 ### 🔄 **Concurrent Operations**
@@ -104,7 +104,7 @@ offsite --restore tank/projects@before-upgrade
 - **Post-reboot recovery** - handles stale locks intelligently
 
 ### 📊 **Monitoring & Logging**
-- **Progress estimation** - shows "Processing chunk 3 of ~15..."
+- **Progress estimation** - shows "Processing shard 3 of ~15..."
 - **Size estimation** - displays GB/MB estimates before starting
 - **Comprehensive logging** - detailed logs for monitoring and troubleshooting
 - **Background-safe logging** - automatic log file creation for `&` jobs
@@ -186,7 +186,7 @@ offsite --restore tank/system --as tank/system-recovery
 ## Security Model
 
 1. **Local encryption** - Data encrypted before upload using age
-2. **Chunked security** - Each chunk independently encrypted
+2. **Sharded security** - Each shard independently encrypted
 3. **Zero-knowledge** - Cloud providers never see your data
 4. **Key management** - Your keys stay on your systems
 5. **Deterministic streams** - Consistent backups enable safe resumption

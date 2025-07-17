@@ -98,10 +98,16 @@ AGE_PUBLIC_KEY_FILE="$HOME/.config/age/zfs-backup.pub"
 AGE_PRIVATE_KEY_FILE="$HOME/.config/age/zfs-backup.txt"
 
 # === Backup Paths ===
-# TEMP_DIR: Directory for temporary 1GB chunks during streaming backup
+# TEMP_DIR: Directory for temporary shards during streaming backup
 # With streaming approach, only ~1GB space needed (vs full dataset size before)
 # Can use /tmp safely now, or set to dedicated location if preferred
 TEMP_DIR="/tmp"
+
+# === Shard Configuration ===
+# Size of each shard for streaming backup (supports K, M, G suffixes)
+# Default: 1G (1 Gigabyte) - adjust based on your needs
+# Examples: 512M (for slower connections), 2G (for faster connections)
+SHARD_SIZE="1G"
 EOF
     
     chmod 600 ~/.config/offsite/config.env

@@ -1,8 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-# Offsite - Unified ZFS Cloud Backup Tool
+# Offsite - Unified ZFS Cloud Backup Tool v2.0
 # Handles both backup and restore operations with ZFS-style syntax
+# Features: Configurable shard sizes, streaming architecture, multi-terminal safety
 
 # === USAGE ===
 show_help() {
@@ -153,6 +154,8 @@ AGE_PRIVATE_KEY_FILE="${AGE_PRIVATE_KEY_FILE:-$HOME/.config/age/zfs-backup.txt}"
 SNAP_PREFIX="${ZFS_SNAP_PREFIX:-auto}"
 RETENTION_DAYS="${ZFS_RETENTION_DAYS:-14}"
 TEMP_DIR="${TEMP_DIR:-/tmp}"
+SHARD_SIZE="${SHARD_SIZE:-1G}"
+VERSION="2.0"
 
 # === DISCOVER PROVIDERS ===
 declare -A PROVIDERS
@@ -491,15 +494,15 @@ stream_zfs_to_cloud() {
     
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting streaming backup ($backup_type)"
     
-    # Check for existing chunks (resumable backup support)
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Checking for existing chunks..."
-    local existing_chunks=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep "^${backup_prefix}-x[0-9][0-9][0-9].zfs.gz.age$" | sort || true))
+    # Check for existing shards (resumable backup support)
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Checking for existing shards..."
+    local existing_shards=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9].zfs.gz.age$" | sort || true))
     
-    if [[ ${#existing_chunks[@]} -gt 0 ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Found ${#existing_chunks[@]} existing chunks - resuming backup"
-        echo "$(date '+%Y-%m-%d %H:%M:%S')       Existing: ${existing_chunks[0]} ... ${existing_chunks[-1]}"
+    if [[ ${#existing_shards[@]} -gt 0 ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     Found ${#existing_shards[@]} existing shards - resuming backup"
+        echo "$(date '+%Y-%m-%d %H:%M:%S')       Existing: ${existing_shards[0]} ... ${existing_shards[-1]}"
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     No existing chunks found - starting fresh backup"
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     No existing shards found - starting fresh backup"
     fi
     
     # Create the zfs send command
@@ -512,10 +515,10 @@ stream_zfs_to_cloud() {
     
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Streaming: $zfs_cmd"
     
-    # Estimate number of chunks based on dataset size
+    # Estimate number of shards based on dataset size
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimating backup size..."
     local dataset_size_bytes=0
-    local estimated_chunks=0
+    local estimated_shards=0
     
     # Get dataset size for progress estimation
     if [[ "$backup_type" == "incremental" && -n "$prev_snap" ]]; then
@@ -532,88 +535,96 @@ stream_zfs_to_cloud() {
         dataset_size_bytes=$(zfs get -H -o value -p used "${current_snap%@*}" 2>/dev/null || echo "1073741824")
     fi
     
-    # Calculate estimated chunks (1GB = 1073741824 bytes)
-    estimated_chunks=$(((dataset_size_bytes + 1073741823) / 1073741824))  # Round up
-    estimated_chunks=$((estimated_chunks > 0 ? estimated_chunks : 1))  # Minimum 1 chunk
+    # Calculate estimated shards based on SHARD_SIZE
+    # Convert SHARD_SIZE to bytes (support K, M, G suffixes)
+    local shard_size_bytes
+    case "$SHARD_SIZE" in
+        *K) shard_size_bytes=$((${SHARD_SIZE%K} * 1024)) ;;
+        *M) shard_size_bytes=$((${SHARD_SIZE%M} * 1024 * 1024)) ;;
+        *G) shard_size_bytes=$((${SHARD_SIZE%G} * 1024 * 1024 * 1024)) ;;
+        *) shard_size_bytes="$SHARD_SIZE" ;;  # Assume bytes if no suffix
+    esac
+    estimated_shards=$(((dataset_size_bytes + shard_size_bytes - 1) / shard_size_bytes))  # Round up
+    estimated_shards=$((estimated_shards > 0 ? estimated_shards : 1))  # Minimum 1 shard
     
     # Show size estimation
     local size_mb=$((dataset_size_bytes / 1024 / 1024))
     if [[ $size_mb -gt 1024 ]]; then
         local size_gb=$((size_mb / 1024))
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: ${size_gb}GB (~${estimated_chunks} chunks)"
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: ${size_gb}GB (~${estimated_shards} shards)"
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: ${size_mb}MB (~${estimated_chunks} chunks)"
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: ${size_mb}MB (~${estimated_shards} shards)"
     fi
     
     # Stream with minimal temp space - use named pipes for zero-copy streaming
-    local chunk_num=1
-    local total_chunks=0
+    local shard_num=1
+    local total_shards=0
     
     # Create a temporary directory for named pipes only
     local pipe_dir=$(mktemp -d)
-    local chunk_pipe="$pipe_dir/chunk_pipe"
+    local shard_pipe="$pipe_dir/shard_pipe"
     
     # Create named pipe for streaming
-    mkfifo "$chunk_pipe"
+    mkfifo "$shard_pipe"
     
-    # Background process to handle chunking
+    # Background process to handle sharding
     {
-        eval "$zfs_cmd" | split -b 1G --numeric-suffixes=1 --suffix-length=3 - "$pipe_dir/chunk-"
-        echo "SPLIT_DONE" > "$chunk_pipe"
+        eval "$zfs_cmd" | split -b "$SHARD_SIZE" --numeric-suffixes=1 --suffix-length=3 - "$pipe_dir/shard-"
+        echo "SPLIT_DONE" > "$shard_pipe"
     } &
     local split_pid=$!
     
-    # Process chunks as they appear - wait for complete chunks
-    local processed_chunks=()
+    # Process shards as they appear - wait for complete shards
+    local processed_shards=()
     while true; do
-        # Get list of chunk files
-        local current_chunks=($(ls "$pipe_dir"/chunk-* 2>/dev/null | sort))
+        # Get list of shard files
+        local current_shards=($(ls "$pipe_dir"/shard-* 2>/dev/null | sort))
         
-        # Process any new complete chunks
-        for chunk_file in "${current_chunks[@]}"; do
+        # Process any new complete shards
+        for shard_file in "${current_shards[@]}"; do
             [[ -f "$chunk_file" ]] || continue
             
             # Skip if already processed
-            local chunk_basename=$(basename "$chunk_file")
-            if printf '%s\n' "${processed_chunks[@]}" | grep -q "^${chunk_basename}$"; then
+            local shard_basename=$(basename "$shard_file")
+            if printf '%s\n' "${processed_shards[@]}" | grep -q "^${shard_basename}$"; then
                 continue
             fi
             
-            # Wait for chunk to be completely written by checking if it's still growing
-            local initial_size=$(stat -c%s "$chunk_file" 2>/dev/null || echo "0")
+            # Wait for shard to be completely written by checking if it's still growing
+            local initial_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
             sleep 0.1
-            local final_size=$(stat -c%s "$chunk_file" 2>/dev/null || echo "0")
+            local final_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
             
             # If file is still growing, skip for now
             if [[ $initial_size -ne $final_size ]]; then
                 continue
             fi
             
-            # If split is still running and this isn't the last chunk, wait a bit more
+            # If split is still running and this isn't the last shard, wait a bit more
             if kill -0 $split_pid 2>/dev/null; then
-                # Check if there might be more chunks coming
-                local next_chunk_num=$(printf "%03d" $((10#${chunk_basename#chunk-} + 1)))
-                if [[ ! -f "$pipe_dir/chunk-$next_chunk_num" ]]; then
-                    # Wait a bit more to ensure chunk is complete
+                # Check if there might be more shards coming
+                local next_shard_num=$(printf "%03d" $((10#${shard_basename#shard-} + 1)))
+                if [[ ! -f "$pipe_dir/shard-$next_shard_num" ]]; then
+                    # Wait a bit more to ensure shard is complete
                     sleep 0.2
-                    local verify_size=$(stat -c%s "$chunk_file" 2>/dev/null || echo "0")
+                    local verify_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
                     if [[ $final_size -ne $verify_size ]]; then
                         continue  # Still growing
                     fi
                 fi
             fi
             
-            # Now process the complete chunk
-            local output_file="${backup_prefix}-x${chunk_basename#chunk-}.zfs.gz.age"
+            # Now process the complete shard
+            local output_file="${backup_prefix}-s${shard_basename#shard-}.zfs.gz.age"
             
-            # Check if chunk already exists (resumable backup)
-            if printf '%s\n' "${existing_chunks[@]}" | grep -q "^${output_file}$"; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       ✓ Chunk $chunk_num of ~$estimated_chunks already exists: $output_file"
+            # Check if shard already exists (resumable backup)
+            if printf '%s\n' "${existing_shards[@]}" | grep -q "^${output_file}$"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       ✓ Shard $shard_num of ~$estimated_shards already exists: $output_file"
             else
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing chunk $chunk_num of ~$estimated_chunks..."
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing shard $shard_num of ~$estimated_shards..."
                 
-                # Stream chunk: compress -> encrypt -> upload
-                if gzip < "$chunk_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
+                # Stream shard: compress -> encrypt -> upload
+                if gzip < "$shard_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
                 else
                     echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
@@ -624,31 +635,31 @@ stream_zfs_to_cloud() {
             fi
             
             # Mark as processed and remove file
-            processed_chunks+=("$chunk_basename")
-            rm -f "$chunk_file"
-            ((chunk_num++))
-            ((total_chunks++))
+            processed_shards+=("$shard_basename")
+            rm -f "$shard_file"
+            ((shard_num++))
+            ((total_shards++))
         done
         
         # Check if split is done
         if ! kill -0 $split_pid 2>/dev/null; then
-            # Process any remaining chunks
-            for chunk_file in "$pipe_dir"/chunk-*; do
-                [[ -f "$chunk_file" ]] || continue
+            # Process any remaining shards
+            for shard_file in "$pipe_dir"/shard-*; do
+                [[ -f "$shard_file" ]] || continue
                 
-                local chunk_basename=$(basename "$chunk_file")
-                if printf '%s\n' "${processed_chunks[@]}" | grep -q "^${chunk_basename}$"; then
+                local shard_basename=$(basename "$shard_file")
+                if printf '%s\n' "${processed_shards[@]}" | grep -q "^${shard_basename}$"; then
                     continue
                 fi
                 
-                local output_file="${backup_prefix}-x${chunk_basename#chunk-}.zfs.gz.age"
+                local output_file="${backup_prefix}-s${shard_basename#shard-}.zfs.gz.age"
                 
-                if ! printf '%s\n' "${existing_chunks[@]}" | grep -q "^${output_file}$"; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing final chunk $chunk_num of ~$estimated_chunks..."
-                    gzip < "$chunk_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"
-                    ((total_chunks++))
+                if ! printf '%s\n' "${existing_shards[@]}" | grep -q "^${output_file}$"; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing final shard $shard_num of ~$estimated_shards..."
+                    gzip < "$shard_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"
+                    ((total_shards++))
                 fi
-                rm -f "$chunk_file"
+                rm -f "$shard_file"
             done
             break
         fi
@@ -661,10 +672,10 @@ stream_zfs_to_cloud() {
     rm -rf "$pipe_dir"
     
     # Show completion with actual vs estimated
-    if [[ $total_chunks -eq $estimated_chunks ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming complete: $total_chunks chunks processed (as estimated)"
+    if [[ $total_shards -eq $estimated_shards ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming complete: $total_shards shards processed (as estimated)"
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming complete: $total_chunks chunks processed (estimated $estimated_chunks)"
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming complete: $total_shards shards processed (estimated $estimated_shards)"
     fi
 }
 
@@ -849,19 +860,19 @@ run_restore() {
     echo "Final backup selection: $backup_prefix"
     echo ""
     
-    # Discover chunks
-    echo "Discovering backup chunks..."
-    local chunk_files=($(rclone lsf "${remote_path}/" 2>/dev/null | grep "^${backup_prefix}-x[0-9][0-9][0-9].zfs.gz.age$" | sort))
+    # Discover shards
+    echo "Discovering backup shards..."
+    local shard_files=($(rclone lsf "${remote_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9].zfs.gz.age$" | sort))
     
-    if [[ ${#chunk_files[@]} -eq 0 ]]; then
-        echo "ERROR: No chunks found for backup prefix: ${backup_prefix}"
+    if [[ ${#shard_files[@]} -eq 0 ]]; then
+        echo "ERROR: No shards found for backup prefix: ${backup_prefix}"
         echo ""
         echo "Available backups for ${source_dataset}:"
         rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^(full|incr)-.*-x[0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-x[0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || echo "No backups found"
         exit 1
     fi
     
-    echo "Found ${#chunk_files[@]} chunks: ${chunk_files[0]} ... ${chunk_files[-1]}"
+    echo "Found ${#shard_files[@]} shards: ${shard_files[0]} ... ${shard_files[-1]}"
     
     # Connection test
     echo "Testing connection to $provider_name..."
@@ -926,26 +937,26 @@ run_restore() {
     echo "Starting restore process..."
     echo "Working directory: $work_dir"
     
-    # Download all chunks
-    echo "Step 1: Downloading chunks..."
-    for chunk_file in "${chunk_files[@]}"; do
-        echo "  Downloading: $chunk_file"
-        rclone copy "${remote_path}/${chunk_file}" ./
+    # Download all shards
+    echo "Step 1: Downloading shards..."
+    for shard_file in "${shard_files[@]}"; do
+        echo "  Downloading: $shard_file"
+        rclone copy "${remote_path}/${shard_file}" ./
     done
     
-    # Decrypt and decompress chunks
-    echo "Step 2: Decrypting and decompressing chunks..."
-    for chunk_file in "${chunk_files[@]}"; do
-        echo "  Processing: $chunk_file"
-        # Extract the chunk number from filename
-        local chunk_num=$(echo "$chunk_file" | sed 's/.*-x\([0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
-        age -d -i "$AGE_PRIVATE_KEY_FILE" "$chunk_file" | gunzip > "chunk-${chunk_num}.restored"
-        echo "    ✓ Restored: chunk-${chunk_num}.restored"
+    # Decrypt and decompress shards
+    echo "Step 2: Decrypting and decompressing shards..."
+    for shard_file in "${shard_files[@]}"; do
+        echo "  Processing: $shard_file"
+        # Extract the shard number from filename
+        local shard_num=$(echo "$shard_file" | sed 's/.*-s\([0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
+        age -d -i "$AGE_PRIVATE_KEY_FILE" "$shard_file" | gunzip > "shard-${shard_num}.restored"
+        echo "    ✓ Restored: shard-${shard_num}.restored"
     done
     
     # Reconstitute stream
     echo "Step 3: Reconstituting ZFS stream..."
-    cat chunk-*.restored > complete-stream.zfs
+    cat shard-*.restored > complete-stream.zfs
     echo "Complete stream size: $(wc -c < complete-stream.zfs) bytes"
     
     # ZFS receive
@@ -961,7 +972,7 @@ run_restore() {
     echo ""
     echo "Source: $source_dataset ($backup_prefix)"
     echo "Target: $target_dataset"
-    echo "Chunks processed: ${#chunk_files[@]}"
+    echo "Shards processed: ${#shard_files[@]}"
     echo "Provider: $provider_name"
     echo ""
     echo "You can now:"

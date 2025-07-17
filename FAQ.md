@@ -62,8 +62,8 @@ offsite --backup rust/hobby &
 - **Example**: 100TB dataset backup uses only ~1GB temp space
 
 **Temp space usage:**
-- Creates 1GB chunks temporarily during streaming
-- Chunks are deleted immediately after upload
+- Creates 1GB shards temporarily during streaming
+- Shards are deleted immediately after upload
 - No persistent storage of the full dataset stream
 
 ## 🔧 Technical Details
@@ -90,14 +90,14 @@ offsite --backup rust/hobby
 ```bash
 # If backup is interrupted, restart with same command
 offsite --backup rust/hobby
-# Output: ✓ Chunk already exists: full-auto-20250117-x001.zfs.gz.age
-# Output: ✓ Chunk already exists: full-auto-20250117-x002.zfs.gz.age
-# Output: Processing chunk 3 of ~5...
+# Output: ✓ Shard already exists: full-auto-20250117-s001.zfs.gz.age
+# Output: ✓ Shard already exists: full-auto-20250117-s002.zfs.gz.age
+# Output: Processing shard 3 of ~5...
 ```
 
 **Resume features:**
-- Checks existing chunks before upload
-- Skips chunks that already exist in cloud storage
+- Checks existing shards before upload
+- Skips shards that already exist in cloud storage
 - Continues from where the interruption occurred
 - Works across different backup sessions
 
@@ -114,10 +114,10 @@ offsite --backup rust/hobby
 
 **Example output:**
 ```
-Estimated size: 2.3GB (~3 chunks)
-Processing chunk 1 of ~3...
-Processing chunk 2 of ~3...
-✓ Streaming complete: 3 chunks processed (as estimated)
+Estimated size: 2.3GB (~3 shards)
+Processing shard 1 of ~3...
+Processing shard 2 of ~3...
+✓ Streaming complete: 3 shards processed (as estimated)
 ```
 
 ## 🔒 Security & Safety
@@ -126,7 +126,7 @@ Processing chunk 2 of ~3...
 **A: Military-grade security** with multiple layers:
 
 1. **End-to-end encryption**: Data encrypted before leaving your system
-2. **Individual chunk encryption**: Each 1GB chunk is independently encrypted
+2. **Individual shard encryption**: Each 1GB shard is independently encrypted
 3. **Zero-knowledge architecture**: Cloud providers never see your data
 4. **Age cryptography**: Modern, secure encryption standard
 
@@ -135,7 +135,7 @@ Processing chunk 2 of ~3...
 # Your data flow
 ZFS data → Compress → Encrypt → Upload to cloud
           ↓
-    Cloud provider sees only encrypted chunks
+    Cloud provider sees only encrypted shards
 ```
 
 ### Q: What happens if I lose my encryption key?
@@ -155,9 +155,9 @@ ZFS data → Compress → Encrypt → Upload to cloud
 ### Q: Can I trust the resumable backup feature?
 **A: Absolutely!** Resumable backups are designed to be safe:
 
-- **Chunk verification**: Each chunk is verified before skipping
+- **Shard verification**: Each shard is verified before skipping
 - **Atomic operations**: Chunks are uploaded completely or not at all
-- **No partial chunks**: Failed uploads don't leave partial data
+- **No partial shards**: Failed uploads don't leave partial data
 - **Consistency checks**: Backup integrity is maintained
 
 ## 🌐 Cloud Storage
@@ -204,7 +204,7 @@ offsite --backup tank/data --provider scaleway &
 ### Q: I'm getting "gzip stdin: file size changed while zipping" errors
 **A: Fixed in latest version!** This was a race condition that's now resolved:
 
-**Root cause:** Processing chunks while they were still being written
+**Root cause:** Processing shards while they were still being written
 **Solution:** Implemented file size stability checking
 
 ```bash
@@ -237,7 +237,7 @@ offsite --backup tank/photos --provider scaleway &
 ```bash
 # Real-time progress
 offsite --backup tank/data
-# Shows: Processing chunk 3 of ~15...
+# Shows: Processing shard 3 of ~15...
 ```
 
 **Log files:**
@@ -308,7 +308,7 @@ offsite --backup tank/data --as @daily-$(date +%Y%m%d)
 
 **New features:**
 - Streaming backup (99.9% less temp space)
-- Progress estimation with chunk counting
+- Progress estimation with shard counting
 - Background execution support
 - Multi-terminal safety with locking
 - Enhanced error handling
@@ -323,7 +323,7 @@ offsite --backup your-dataset  # Uses new streaming approach
 ### Q: Can I restore backups made with older versions?
 **A: Yes!** Full backward compatibility:
 
-- All chunk formats remain compatible
+- All shard formats remain compatible
 - Restore process unchanged
 - Encryption/decryption identical
 - File naming conventions preserved
