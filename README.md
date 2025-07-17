@@ -12,7 +12,7 @@
 ### 🚀 **Bulletproof Reliability**
 - **Resumable backups** - interrupted transfers continue where they left off
 - **Multi-provider support** - backup to multiple clouds simultaneously
-- **Incremental backups** - only transfer what changed
+- **Full backups** - always complete, predictable backups
 - **Automatic retry** - handles network failures gracefully
 - **Background execution** - safe to run in background with full logging
 - **Multi-terminal support** - run multiple backups concurrently with conflict prevention
@@ -31,12 +31,15 @@
 
 ### 🎯 **Dead Simple**
 ```bash
-# Recommended: Snapshot first, then backup
-zfs snapshot tank/important/data@backup-$(date +%Y%m%d)
+# Backup with custom snapshot name
 offsite --backup tank/important/data@backup-$(date +%Y%m%d)
 
-# Or let offsite create the snapshot for you
-offsite --backup tank/important/data --as @backup-$(date +%Y%m%d)
+# Auto-generated snapshot backup
+offsite --backup tank/important/data
+
+# Special snapshot names
+offsite --backup tank/photos@now
+offsite --backup tank/photos@today
 
 # Background backup with progress tracking
 offsite --backup tank/photos@daily-backup &
@@ -44,6 +47,7 @@ tail -f ~/offsite-backup-tank_photos-*.log
 
 # Restore when needed  
 offsite --restore tank/important/data@backup-20250117
+offsite --restore tank/important/data --as tank/recovered-data
 ```
 
 ## Quick Start
@@ -64,16 +68,18 @@ RCLONE_REMOTE="your-cloud-provider:bucket-name/backups"
 
 ### 3. Backup
 ```bash
-# BEST PRACTICE: Create snapshot first, then backup
-zfs snapshot tank/photos@daily-$(date +%Y%m%d)
+# Backup with custom snapshot name
 offsite --backup tank/photos@daily-$(date +%Y%m%d)
 
+# Auto-generated snapshot backup
+offsite --backup tank/photos
+
 # Backup to specific provider
-zfs snapshot tank/documents@backup-$(date +%Y%m%d)
 offsite --backup tank/documents@backup-$(date +%Y%m%d) --provider backblaze
 
-# Let offsite create the snapshot for you
-offsite --backup tank/projects --as @before-upgrade
+# Special snapshot names
+offsite --backup tank/projects@now
+offsite --backup tank/projects@today
 ```
 
 ### 4. Restore
@@ -85,7 +91,7 @@ offsite --restore tank/photos
 offsite --restore tank/photos --as tank/photos-recovered
 
 # Restore specific backup
-offsite --restore tank/projects@before-upgrade
+offsite --restore tank/projects@backup-20250117
 ```
 
 ## Key Features
@@ -96,6 +102,7 @@ offsite --restore tank/projects@before-upgrade
 - **Real-time progress** - see shard progress and size estimates
 - **Smart resumption** - skips already uploaded shards on restart
 - **Multi-cloud redundancy** - backup to multiple providers simultaneously
+- **Always full backups** - predictable, complete backups every time
 
 ### 🔄 **Concurrent Operations**
 - **Background execution** - safe to run with `&` operator
@@ -148,11 +155,14 @@ tail -f ~/offsite-backup-*.log
 ### 🕐 **Automated Backups**
 ```bash
 # Daily backup at 2 AM (background-safe)
-echo "0 2 * * * offsite --backup tank/critical --as @daily-\$(date +%Y%m%d)" | crontab -
+echo "0 2 * * * offsite --backup tank/critical@daily-\$(date +%Y%m%d)" | crontab -
 
 # Multiple daily backups to different providers
-echo "0 2 * * * offsite --backup tank/data --as @backup-\$(date +%Y%m%d) --provider backblaze" | crontab -
-echo "0 3 * * * offsite --backup tank/data --as @backup-\$(date +%Y%m%d) --provider scaleway" | crontab -
+echo "0 2 * * * offsite --backup tank/data@backup-\$(date +%Y%m%d) --provider backblaze" | crontab -
+echo "0 3 * * * offsite --backup tank/data@backup-\$(date +%Y%m%d) --provider scaleway" | crontab -
+
+# Simple auto-timestamped backups
+echo "0 2 * * * offsite --backup tank/critical" | crontab -
 ```
 
 ### 🌐 **Multi-Provider Redundancy**

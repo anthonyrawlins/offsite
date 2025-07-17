@@ -7,8 +7,8 @@
 
 ```bash
 # Safe background operations
-offsite --backup rust/hobby &
-offsite --backup tank/data --provider scaleway &
+offsite --backup rust/hobby@backup-$(date +%Y%m%d) &
+offsite --backup tank/data@now --provider scaleway &
 offsite --restore rust/old-backup --as rust/recovered &
 ```
 
@@ -33,24 +33,24 @@ ps aux | grep offsite
 
 ```bash
 # ✅ SAFE - Different datasets
-offsite --backup rust/hobby &
-offsite --backup rust/projects &
-offsite --backup tank/data &
+offsite --backup rust/hobby@backup-$(date +%Y%m%d) &
+offsite --backup rust/projects@now &
+offsite --backup tank/data@daily &
 
 # ✅ SAFE - Same dataset, different providers
-offsite --backup tank/data --provider backblaze &
-offsite --backup tank/data --provider scaleway &
+offsite --backup tank/data@backup-$(date +%Y%m%d) --provider backblaze &
+offsite --backup tank/data@backup-$(date +%Y%m%d) --provider scaleway &
 
 # ✅ SAFE - Backup + restore different datasets
-offsite --backup rust/hobby &
-offsite --restore rust/old-backup &
+offsite --backup rust/hobby@now &
+offsite --restore rust/old-backup --as rust/recovered &
 ```
 
 **Automatic conflict prevention:**
 ```bash
 # ❌ BLOCKED - Same dataset, same operation
-offsite --backup rust/hobby &
-offsite --backup rust/hobby &
+offsite --backup rust/hobby@backup1 &
+offsite --backup rust/hobby@backup2 &
 # Second instance shows: ERROR: Another offsite backup is already running for dataset rust/hobby (PID 12345)
 ```
 
@@ -89,9 +89,9 @@ offsite --backup rust/hobby
 
 ```bash
 # If backup is interrupted, restart with same command
-offsite --backup rust/hobby
-# Output: ✓ Shard already exists: full-auto-20250117-s001.zfs.gz.age
-# Output: ✓ Shard already exists: full-auto-20250117-s002.zfs.gz.age
+offsite --backup rust/hobby@backup-20250117
+# Output: ✓ Shard already exists: full-backup-20250117-s001.zfs.gz.age
+# Output: ✓ Shard already exists: full-backup-20250117-s002.zfs.gz.age
 # Output: Processing shard 3 of ~5...
 ```
 
@@ -236,7 +236,7 @@ offsite --backup tank/photos --provider scaleway &
 **Console output:**
 ```bash
 # Real-time progress
-offsite --backup tank/data
+offsite --backup tank/data@backup-$(date +%Y%m%d)
 # Shows: Processing shard 3 of ~15...
 ```
 
@@ -266,36 +266,36 @@ nethogs
 
 **Personal use:**
 ```bash
-# Daily incremental backups
-0 2 * * * offsite --backup tank/important --as @daily-$(date +%Y%m%d)
+# Daily backups
+0 2 * * * offsite --backup tank/important@daily-$(date +%Y%m%d)
 
-# Weekly full backups
-0 1 * * 0 offsite --backup tank/important --as @weekly-$(date +%Y%m%d) --full
+# Alternative: Auto-timestamped backups
+0 2 * * * offsite --backup tank/important
 ```
 
 **Professional use:**
 ```bash
 # Multiple daily backups
-0 2,14 * * * offsite --backup tank/critical --as @backup-$(date +%Y%m%d-%H%M)
+0 2,14 * * * offsite --backup tank/critical@backup-$(date +%Y%m%d-%H%M)
 
 # Multiple providers
-0 2 * * * offsite --backup tank/data --provider backblaze
-0 3 * * * offsite --backup tank/data --provider scaleway
+0 2 * * * offsite --backup tank/data@backup-$(date +%Y%m%d) --provider backblaze
+0 3 * * * offsite --backup tank/data@backup-$(date +%Y%m%d) --provider scaleway
 ```
 
-### Q: Should I use full or incremental backups?
-**A: Both!** Recommended strategy:
+### Q: Are backups always full backups?
+**A: Yes!** Version 2.0 simplified the backup process:
 
-1. **Initial**: Full backup to establish baseline
-2. **Regular**: Incremental backups for efficiency
-3. **Periodic**: Full backups for clean restore points
+- **Always full backups**: No incremental complexity
+- **Predictable behavior**: Every backup is complete and independent
+- **Easier restore**: No dependency chains to worry about
+- **Reliable**: No risk of broken incremental chains
 
 ```bash
-# Weekly full backup
-offsite --backup tank/data --as @weekly-$(date +%Y%m%d) --full
-
-# Daily incremental backups
-offsite --backup tank/data --as @daily-$(date +%Y%m%d)
+# All backups are full backups
+offsite --backup tank/data@backup-$(date +%Y%m%d)
+offsite --backup tank/data@daily-backup
+offsite --backup tank/data  # Auto-timestamped
 ```
 
 ## 🔄 Migration & Compatibility
@@ -312,12 +312,15 @@ offsite --backup tank/data --as @daily-$(date +%Y%m%d)
 - Background execution support
 - Multi-terminal safety with locking
 - Enhanced error handling
+- Simplified backup logic (always full backups)
+- Configurable shard sizes
+- Removed --as flag from backup operations
 
 **Migration:**
 ```bash
 # Simply update and continue using
 git pull
-offsite --backup your-dataset  # Uses new streaming approach
+offsite --backup your-dataset@backup-$(date +%Y%m%d)  # Uses new simplified approach
 ```
 
 ### Q: Can I restore backups made with older versions?
