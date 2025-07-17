@@ -486,7 +486,7 @@ stream_zfs_to_cloud() {
             # Check if split is done
             if ! kill -0 $split_pid 2>/dev/null; then
                 # Process any remaining chunks
-                for chunk_file in "$pipe_dir"/chunk-* 2>/dev/null; do
+                for chunk_file in "$pipe_dir"/chunk-*; do
                     [[ -f "$chunk_file" ]] || continue
                     
                     local output_file="${backup_prefix}-x${chunk_file##*/chunk-}.zfs.gz.age"
