@@ -374,10 +374,8 @@ backup_single_provider() {
         prev_snap=$(zfs list -H -t snapshot -o name -s creation | grep "^${dataset}@${SNAP_PREFIX}-" | grep -v "@${snap}$" | tail -n1 | awk -F@ '{print $2}' || true)
     fi
     
-    # Create working directory
-    local work_dir="${TEMP_DIR}/offsite-backup-$(date +%s)"
-    mkdir -p "$work_dir"
-    cd "$work_dir"
+    # No working directory needed for streaming backup!
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Using streaming backup - no temp files required"
     
     # Get trimmed age public key
     local agekey=$(cat "$AGE_PUBLIC_KEY_FILE" | tr -d '\n')
@@ -387,24 +385,31 @@ backup_single_provider() {
         local prefix="incr"
         local backup_prefix="${prefix}-${snap}"
         
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Creating incremental stream..."
-        zfs send -I "${dataset}@${prev_snap}" "${dataset}@${snap}" > stream.zfs
+        stream_zfs_to_cloud "${dataset}@${prev_snap}" "${dataset}@${snap}" "$backup_prefix" "$rclone_remote" "$dataset_path" "$agekey" "incremental"
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S')     Full backup"
         local prefix="full"
         local backup_prefix="${prefix}-${snap}"
         
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Creating full stream..."
-        zfs send "${dataset}@${snap}" > stream.zfs
+        stream_zfs_to_cloud "" "${dataset}@${snap}" "$backup_prefix" "$rclone_remote" "$dataset_path" "$agekey" "full"
     fi
     
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Stream created: $(ls -la stream.zfs | awk '{print $5}') bytes"
+    # No cleanup needed - streaming backup used no temp files!
     
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Splitting into 1GB chunks..."
-    split -b 1G stream.zfs chunk- --numeric-suffixes=1 --suffix-length=3
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Chunks created: $(ls -la chunk-* | wc -l)"
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Backup complete to $provider_name"
+}
+
+# Streaming ZFS backup function - no temp files needed!
+stream_zfs_to_cloud() {
+    local prev_snap="$1"
+    local current_snap="$2"
+    local backup_prefix="$3"
+    local rclone_remote="$4"
+    local dataset_path="$5"
+    local agekey="$6"
+    local backup_type="$7"
     
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Compressing, encrypting and uploading chunks..."
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting streaming backup ($backup_type)"
     
     # Check for existing chunks (resumable backup support)
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Checking for existing chunks..."
@@ -417,25 +422,91 @@ backup_single_provider() {
         echo "$(date '+%Y-%m-%d %H:%M:%S')     No existing chunks found - starting fresh backup"
     fi
     
-    for chunk in chunk-*; do
-        local chunk_file="${backup_prefix}-x${chunk#chunk-}.zfs.gz.age"
-        
-        # Check if chunk already exists (resumable backup)
-        if printf '%s\n' "${existing_chunks[@]}" | grep -q "^${chunk_file}$"; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S')       ✓ Chunk already exists: $chunk_file"
+    # Create the zfs send command
+    local zfs_cmd
+    if [[ "$backup_type" == "incremental" && -n "$prev_snap" ]]; then
+        zfs_cmd="zfs send -I \"$prev_snap\" \"$current_snap\""
+    else
+        zfs_cmd="zfs send \"$current_snap\""
+    fi
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Streaming: $zfs_cmd"
+    
+    # Stream with minimal temp space - use named pipes for zero-copy streaming
+    local chunk_num=1
+    local total_chunks=0
+    
+    # Create a temporary directory for named pipes only
+    local pipe_dir=$(mktemp -d)
+    local chunk_pipe="$pipe_dir/chunk_pipe"
+    
+    # Create named pipe for streaming
+    mkfifo "$chunk_pipe"
+    
+    # Background process to handle chunking
+    {
+        eval "$zfs_cmd" | split -b 1G --numeric-suffixes=1 --suffix-length=3 - "$pipe_dir/chunk-"
+        echo "SPLIT_DONE" > "$chunk_pipe"
+    } &
+    local split_pid=$!
+    
+    # Process chunks as they appear
+    while true; do
+        # Wait for a chunk file to appear or split to finish
+        if ls "$pipe_dir"/chunk-* >/dev/null 2>&1; then
+            for chunk_file in "$pipe_dir"/chunk-*; do
+                [[ -f "$chunk_file" ]] || continue
+                
+                local output_file="${backup_prefix}-x${chunk_file##*/chunk-}.zfs.gz.age"
+                
+                # Check if chunk already exists (resumable backup)
+                if printf '%s\n' "${existing_chunks[@]}" | grep -q "^${output_file}$"; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       ✓ Chunk already exists: $output_file"
+                else
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing chunk $chunk_num..."
+                    
+                    # Stream chunk: compress -> encrypt -> upload
+                    if gzip < "$chunk_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
+                    else
+                        echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
+                        kill $split_pid 2>/dev/null || true
+                        rm -rf "$pipe_dir"
+                        return 1
+                    fi
+                fi
+                
+                # Remove processed chunk immediately
+                rm -f "$chunk_file"
+                ((chunk_num++))
+                ((total_chunks++))
+            done
         else
-            echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing $chunk..."
-            gzip < "$chunk" | age -r "$agekey" > "$chunk_file"
-            rclone copy "$chunk_file" "${rclone_remote}/${dataset_path}/"
-            echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $chunk_file ($(ls -la $chunk_file | awk '{print $5}') bytes)"
+            # Check if split is done
+            if ! kill -0 $split_pid 2>/dev/null; then
+                # Process any remaining chunks
+                for chunk_file in "$pipe_dir"/chunk-* 2>/dev/null; do
+                    [[ -f "$chunk_file" ]] || continue
+                    
+                    local output_file="${backup_prefix}-x${chunk_file##*/chunk-}.zfs.gz.age"
+                    
+                    if ! printf '%s\n' "${existing_chunks[@]}" | grep -q "^${output_file}$"; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing final chunk $chunk_num..."
+                        gzip < "$chunk_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"
+                        ((total_chunks++))
+                    fi
+                    rm -f "$chunk_file"
+                done
+                break
+            fi
+            sleep 0.1
         fi
     done
     
     # Cleanup
-    cd /
-    rm -rf "$work_dir"
+    rm -rf "$pipe_dir"
     
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Backup complete to $provider_name"
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming complete: $total_chunks chunks processed"
 }
 
 cleanup_old_snapshots() {

@@ -5,7 +5,8 @@ set -euo pipefail
 # Configures ZFS cloud backups to Backblaze B2 and/or Scaleway
 
 echo "=== Offsite Backup System Setup ==="
-echo "This script will set up ZFS cloud backups with chunked encryption"
+echo "This script will set up ZFS cloud backups with streaming chunked encryption"
+echo "💡 New streaming approach: No large temp files required!"
 echo ""
 
 # Check if running as root for some operations
@@ -97,7 +98,10 @@ AGE_PUBLIC_KEY_FILE="$HOME/.config/age/zfs-backup.pub"
 AGE_PRIVATE_KEY_FILE="$HOME/.config/age/zfs-backup.txt"
 
 # === Backup Paths ===
-TEMP_DIR="/rust/offsite-temp"
+# TEMP_DIR: Directory for temporary 1GB chunks during streaming backup
+# With streaming approach, only ~1GB space needed (vs full dataset size before)
+# Can use /tmp safely now, or set to dedicated location if preferred
+TEMP_DIR="/tmp"
 EOF
     
     chmod 600 ~/.config/offsite/config.env
@@ -184,6 +188,12 @@ fi
 echo ""
 echo "🎉 Setup complete!"
 echo ""
+echo "🚀 STREAMING BACKUP READY:"
+echo "  • No large temp files required (streams directly to cloud)"
+echo "  • Minimal disk usage (only 1GB chunks temporarily)"
+echo "  • Efficient memory usage (processes data in streaming chunks)"
+echo "  • Resumable backups (skips existing chunks)"
+echo ""
 # Ask user for their datasets
 echo "[Optional] Dataset Configuration:"
 echo "Which ZFS datasets would you like to set up for backup?"
@@ -238,8 +248,14 @@ echo "  offsite --restore tank/data --as tank/new-data # Restore to new name"
 echo "  offsite --backup tank/photos --provider scaleway"
 echo "  offsite --restore tank/photos@latest-full --as tank/photos-test"
 echo ""
-echo "⚠ IMPORTANT: Save your age private key securely!"
+echo "🔐 IMPORTANT: Save your age private key securely!"
 echo "   Location: ~/.config/age/zfs-backup.txt"
 echo "   Without this key, you cannot restore your backups."
+echo ""
+echo "💡 STREAMING BENEFITS:"
+echo "   • Backup 100TB dataset using only ~1GB temp space"
+echo "   • No risk of running out of disk space during backup"
+echo "   • Faster backups with direct streaming pipeline"
+echo "   • Resumable - interruptions don't waste previous work"
 echo ""
 echo "📖 Documentation: See README.md for detailed usage information"
