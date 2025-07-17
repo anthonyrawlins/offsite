@@ -388,7 +388,7 @@ run_backup() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') Dataset: $BACKUP_DATASET"
     echo "$(date '+%Y-%m-%d %H:%M:%S') Snapshot: $BACKUP_SNAPSHOT"
     echo "$(date '+%Y-%m-%d %H:%M:%S') Providers: ${SELECTED_PROVIDERS[*]}"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') Force full: $force_full"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') Backup type: full (always)"
     echo "$(date '+%Y-%m-%d %H:%M:%S') Log file: $DATASET_LOG_FILE"
     
     # Backup to each provider
@@ -397,7 +397,7 @@ run_backup() {
     for prov in "${SELECTED_PROVIDERS[@]}"; do
         rclone_remote="${PROVIDERS[$prov]}"
         provider_name="${PROVIDER_NAMES[$prov]}"
-        backup_single_provider "$BACKUP_DATASET" "$BACKUP_SNAPSHOT" "$prov" "$rclone_remote" "$provider_name" "$force_full"
+        backup_single_provider "$BACKUP_DATASET" "$BACKUP_SNAPSHOT" "$prov" "$rclone_remote" "$provider_name"
     done
     
     # Cleanup old snapshots
