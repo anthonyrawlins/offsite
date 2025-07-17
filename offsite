@@ -433,6 +433,39 @@ stream_zfs_to_cloud() {
     
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Streaming: $zfs_cmd"
     
+    # Estimate number of chunks based on dataset size
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimating backup size..."
+    local dataset_size_bytes=0
+    local estimated_chunks=0
+    
+    # Get dataset size for progress estimation
+    if [[ "$backup_type" == "incremental" && -n "$prev_snap" ]]; then
+        # For incremental: estimate based on changes since last snapshot
+        # This is approximate - actual size depends on data changes
+        dataset_size_bytes=$(zfs get -H -o value -p written "$current_snap" 2>/dev/null | grep -v '^-$' || echo "0")
+        if [[ "$dataset_size_bytes" == "0" || "$dataset_size_bytes" == "-" ]]; then
+            # Fallback: estimate as 10% of full dataset for incremental
+            local full_size=$(zfs get -H -o value -p used "${current_snap%@*}" 2>/dev/null || echo "1073741824")
+            dataset_size_bytes=$((full_size / 10))
+        fi
+    else
+        # For full backup: get dataset used size
+        dataset_size_bytes=$(zfs get -H -o value -p used "${current_snap%@*}" 2>/dev/null || echo "1073741824")
+    fi
+    
+    # Calculate estimated chunks (1GB = 1073741824 bytes)
+    estimated_chunks=$(((dataset_size_bytes + 1073741823) / 1073741824))  # Round up
+    estimated_chunks=$((estimated_chunks > 0 ? estimated_chunks : 1))  # Minimum 1 chunk
+    
+    # Show size estimation
+    local size_mb=$((dataset_size_bytes / 1024 / 1024))
+    if [[ $size_mb -gt 1024 ]]; then
+        local size_gb=$((size_mb / 1024))
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: ${size_gb}GB (~${estimated_chunks} chunks)"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: ${size_mb}MB (~${estimated_chunks} chunks)"
+    fi
+    
     # Stream with minimal temp space - use named pipes for zero-copy streaming
     local chunk_num=1
     local total_chunks=0
@@ -462,9 +495,9 @@ stream_zfs_to_cloud() {
                 
                 # Check if chunk already exists (resumable backup)
                 if printf '%s\n' "${existing_chunks[@]}" | grep -q "^${output_file}$"; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       ✓ Chunk already exists: $output_file"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       ✓ Chunk $chunk_num of ~$estimated_chunks already exists: $output_file"
                 else
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing chunk $chunk_num..."
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing chunk $chunk_num of ~$estimated_chunks..."
                     
                     # Stream chunk: compress -> encrypt -> upload
                     if gzip < "$chunk_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
@@ -492,7 +525,7 @@ stream_zfs_to_cloud() {
                     local output_file="${backup_prefix}-x${chunk_file##*/chunk-}.zfs.gz.age"
                     
                     if ! printf '%s\n' "${existing_chunks[@]}" | grep -q "^${output_file}$"; then
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing final chunk $chunk_num..."
+                        echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing final chunk $chunk_num of ~$estimated_chunks..."
                         gzip < "$chunk_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"
                         ((total_chunks++))
                     fi
@@ -507,7 +540,12 @@ stream_zfs_to_cloud() {
     # Cleanup
     rm -rf "$pipe_dir"
     
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming complete: $total_chunks chunks processed"
+    # Show completion with actual vs estimated
+    if [[ $total_chunks -eq $estimated_chunks ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming complete: $total_chunks chunks processed (as estimated)"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming complete: $total_chunks chunks processed (estimated $estimated_chunks)"
+    fi
 }
 
 cleanup_old_snapshots() {
