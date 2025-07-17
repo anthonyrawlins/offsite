@@ -525,7 +525,7 @@ stream_zfs_to_cloud() {
         
         # Process any new complete shards
         for shard_file in "${current_shards[@]}"; do
-            [[ -f "$chunk_file" ]] || continue
+            [[ -f "$shard_file" ]] || continue
             
             # Skip if already processed
             local shard_basename=$(basename "$shard_file")
