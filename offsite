@@ -327,6 +327,18 @@ run_backup() {
     # Simple logging without process substitution
     touch "$DATASET_LOG_FILE"
     
+    # Background-safe logging function
+    log_message() {
+        local message="$1"
+        echo "$message" | tee -a "$DATASET_LOG_FILE"
+    }
+    
+    # Check if running in background and inform user
+    if [[ ! -t 1 ]]; then
+        log_message "$(date '+%Y-%m-%d %H:%M:%S') INFO: Running in background mode"
+        log_message "$(date '+%Y-%m-%d %H:%M:%S') INFO: Progress logged to $DATASET_LOG_FILE"
+    fi
+    
     echo "$(date '+%Y-%m-%d %H:%M:%S') === Offsite Backup Started ==="
     echo "$(date '+%Y-%m-%d %H:%M:%S') Dataset: $BACKUP_DATASET"
     echo "$(date '+%Y-%m-%d %H:%M:%S') Snapshot: $BACKUP_SNAPSHOT"
@@ -758,6 +770,14 @@ run_restore() {
         
         if [[ "$target_type" == "filesystem" ]]; then
             echo "WARNING: Target dataset $target_dataset already exists"
+            
+            # Check if running in background (no TTY)
+            if [[ ! -t 0 ]]; then
+                echo "ERROR: Cannot prompt for confirmation when running in background"
+                echo "Target dataset already exists. Use --as to specify a different target name"
+                exit 1
+            fi
+            
             read -p "Do you want to destroy and recreate it? (y/N): " -n 1 -r
             echo
             if [[ ! $REPLY =~ ^[Yy]$ ]]; then
