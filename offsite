@@ -215,10 +215,6 @@ run_backup() {
         local dataset="${dataset_arg%@*}"
         local snapshot_spec="${dataset_arg#*@}"
         
-        if [[ -n "$as_arg" ]]; then
-            echo "ERROR: Cannot specify both dataset@snapshot and --as"
-            exit 1
-        fi
         
         # Handle special snapshot names
         case "$snapshot_spec" in
