@@ -276,6 +276,27 @@ run_backup() {
             echo "ERROR: Failed to create snapshot"
             exit 1
         fi
+        
+        # Wait for snapshot to be fully available
+        echo "Waiting for snapshot to be fully available..."
+        local retry_count=0
+        while [[ $retry_count -lt 30 ]]; do
+            if zfs list "${BACKUP_DATASET}@${BACKUP_SNAPSHOT}" >/dev/null 2>&1; then
+                # Double-check snapshot is ready by trying to get its properties
+                if zfs get -H -o value creation "${BACKUP_DATASET}@${BACKUP_SNAPSHOT}" >/dev/null 2>&1; then
+                    echo "✓ Snapshot ready for backup"
+                    break
+                fi
+            fi
+            echo "  Waiting for snapshot to be ready... (${retry_count}/30)"
+            sleep 1
+            ((retry_count++))
+        done
+        
+        if [[ $retry_count -eq 30 ]]; then
+            echo "ERROR: Snapshot creation timed out or snapshot not accessible"
+            exit 1
+        fi
     fi
     
     # Validate dataset exists
