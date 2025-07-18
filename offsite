@@ -20,8 +20,8 @@ ZFS-STYLE SYNTAX:
                          For restore: restore full dataset state (latest backup)
   dataset@snapshot      - For backup: create/use specific snapshot and backup
                          For restore: restore to specific backup point
-  dataset@now           - For backup: create snapshot with timestamp
-  dataset@today         - For backup: create snapshot with date
+  dataset@now           - For backup: create snapshot literally named 'now'
+  dataset@today         - For backup: create snapshot with today's date
   dataset@latest        - For restore: same as dataset (ZFS semantics)
   dataset@latest-full   - For restore: most recent full backup only
 
@@ -39,7 +39,7 @@ COMMON OPTIONS:
 EXAMPLES:
   # Backup operations (always full backups)
   offsite --backup tank/important/data                    # Auto-timestamped snapshot
-  offsite --backup tank/photos@now --provider scaleway    # Snapshot with timestamp
+  offsite --backup tank/photos@now --provider scaleway    # Snapshot named 'now'
   offsite --backup tank/docs@backup-$(date +%Y%m%d)       # Custom snapshot name
   offsite --backup tank/projects@today                    # Snapshot with date
   
@@ -249,9 +249,8 @@ run_backup() {
                 today)
                     snapshot_spec="${SNAP_PREFIX}-$(date +%Y%m%d)"
                     ;;
-                now)
-                    snapshot_spec="${SNAP_PREFIX}-$(date +%Y%m%d-%H%M%S)"
-                    ;;
+                # Note: @now creates a snapshot literally named 'now', not auto-timestamped
+                # For auto-timestamped snapshots, use dataset without @
             esac
             
             # Check again after transformation
