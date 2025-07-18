@@ -1497,11 +1497,8 @@ list_dataset_backups() {
         #     status="✅ Complete"
         # fi
         
-        # Extract backup info from prefix
-        local backup_type="${prefix%%-*}"
-        local backup_date="${prefix#*-}"
-        
-        echo "    $status $backup_type-$backup_date ($shard_count shards)"
+        # Display backup info (new format is dataset:snapshot)
+        echo "    $status $prefix ($shard_count shards)"
     done
 }
 
