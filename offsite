@@ -590,6 +590,7 @@ stream_zfs_to_cloud() {
                 local output_file="${backup_prefix}-s$(printf "%03d" "$shard_num").zfs.gz.age"
                 
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       Creating shard $shard_num..."
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       Running: dd bs=$dynamic_shard_size_bytes count=1 of=$shard_file"
                 
                 # Read exactly one shard worth of data (with backpressure)
                 if ! dd bs="$dynamic_shard_size_bytes" count=1 of="$shard_file" 2>/dev/null; then
@@ -629,6 +630,8 @@ stream_zfs_to_cloud() {
                 rm -f "$shard_file"
                 ((processed_count++))
                 ((shard_num++))
+                
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       Completed shard processing, moving to shard $shard_num"
                 
                 # Exit if we've reached estimated shard count and stream seems complete
                 if [[ $shard_num -gt $estimated_shards ]] && [[ ! -s "$shard_file" ]]; then
