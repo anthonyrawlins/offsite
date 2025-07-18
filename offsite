@@ -1349,7 +1349,7 @@ run_restore() {
     echo "Starting restore process..."
     echo "Working directory: $work_dir"
     
-    # Stream to ZFS receive with individual progress bars
+    # Stream to ZFS receive with individual progress bars and pipeline buffer
     echo "Step 1: Streaming ${#shard_files[@]} shards to ZFS receive..."
     echo ""
     
@@ -1367,14 +1367,25 @@ run_restore() {
     echo ""
     
     local total_shards=${#sorted_shards[@]}
+    local pipeline_buffer_size=5  # Download 5 shards in advance
     
-    # Stream: download → decrypt → decompress → ZFS receive (all in one pipeline)
-    # Each shard gets its own progress bar
+    # Create temporary directory for buffering
+    local buffer_dir="$work_dir/buffer"
+    mkdir -p "$buffer_dir"
+    
+    # Stream with pipeline buffer and individual progress bars
     {
-        local shard_index=0
-        for entry in "${sorted_shards[@]}"; do
+        local consume_index=0
+        local download_index=0
+        local active_downloads=()
+        
+        # Function to start downloading a shard
+        start_download() {
+            local index="$1"
+            local entry="${sorted_shards[$index]}"
             local shard_file="${entry#*:}"
-            local shard_num=$(printf "%03d" $((shard_index + 1)))
+            local shard_num=$(printf "%03d" $((index + 1)))
+            local buffer_file="$buffer_dir/shard_${index}"
             
             # Get shard size for progress bar
             local shard_size=$(rclone size "${remote_path}/${shard_file}" 2>/dev/null | grep "Total size:" | sed 's/.*(\([0-9]*\) Bytes).*/\1/')
@@ -1382,23 +1393,58 @@ run_restore() {
             # Progress bar display
             local progress_name="Shard ${shard_num}/${total_shards}"
             
-            # Stream with individual progress bar: download → decrypt → decompress
-            if [[ -n "$shard_size" ]] && [[ "$shard_size" -gt 0 ]]; then
-                rclone cat "${remote_path}/${shard_file}" | \
-                    pv -p -t -e -r -s "$shard_size" -N "$progress_name" | \
-                    age -d -i "$AGE_PRIVATE_KEY_FILE" | \
-                    gunzip
-            else
-                # Fallback without size
-                rclone cat "${remote_path}/${shard_file}" | \
-                    pv -p -t -e -r -N "$progress_name" | \
-                    age -d -i "$AGE_PRIVATE_KEY_FILE" | \
-                    gunzip
+            # Download in background with individual progress bar
+            {
+                if [[ -n "$shard_size" ]] && [[ "$shard_size" -gt 0 ]]; then
+                    rclone cat "${remote_path}/${shard_file}" | \
+                        pv -p -t -e -r -s "$shard_size" -N "$progress_name" | \
+                        age -d -i "$AGE_PRIVATE_KEY_FILE" | \
+                        gunzip > "$buffer_file"
+                else
+                    # Fallback without size
+                    rclone cat "${remote_path}/${shard_file}" | \
+                        pv -p -t -e -r -N "$progress_name" | \
+                        age -d -i "$AGE_PRIVATE_KEY_FILE" | \
+                        gunzip > "$buffer_file"
+                fi
+            } &
+            
+            echo $!  # Return PID
+        }
+        
+        # Start initial buffer of downloads
+        for ((i=0; i<pipeline_buffer_size && i<total_shards; i++)); do
+            local pid=$(start_download "$i")
+            active_downloads[$i]=$pid
+            ((download_index++))
+        done
+        
+        # Process shards in order
+        while [[ $consume_index -lt $total_shards ]]; do
+            local buffer_file="$buffer_dir/shard_${consume_index}"
+            local pid=${active_downloads[$consume_index]}
+            
+            # Wait for this shard to complete
+            wait $pid
+            
+            # Stream the completed shard to ZFS receive
+            cat "$buffer_file"
+            rm -f "$buffer_file"
+            
+            # Start next download if more remain
+            if [[ $download_index -lt $total_shards ]]; then
+                local next_pid=$(start_download "$download_index")
+                active_downloads[$download_index]=$next_pid
+                ((download_index++))
             fi
             
-            ((shard_index++))
+            ((consume_index++))
         done
+        
     } | pv -p -t -e -r -B 1M -N "ZFS Receive" | zfs recv -F "$target_dataset"
+    
+    # Clean up buffer directory
+    rm -rf "$buffer_dir"
     
     local zfs_recv_result=$?
     
