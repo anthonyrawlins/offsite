@@ -13,6 +13,7 @@ Usage: offsite [--backup|--restore] <dataset[@backup]> [options]
 OPERATIONS:
   --backup, -b    Backup a ZFS dataset to cloud storage
   --restore, -r   Restore a ZFS dataset from cloud storage
+  --list, -l      List available backups and show completion status
 
 ZFS-STYLE SYNTAX:
   dataset               - For backup: create auto-timestamped snapshot and backup
@@ -83,6 +84,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --restore|-r)
             OPERATION="restore"
+            shift
+            ;;
+        --list|-l)
+            OPERATION="list"
             shift
             ;;
         --provider)
@@ -206,6 +211,11 @@ case "$OPERATION" in
         # Source the restore functionality
         source <(sed -n '/^# === RESTORE FUNCTIONS ===/,/^# === END RESTORE FUNCTIONS ===/p' "$0")
         run_restore "$DATASET_ARG" "$PROVIDER" "$AS_ARG"
+        ;;
+    list)
+        # Source the list functionality  
+        source <(sed -n '/^# === LIST FUNCTIONS ===/,/^# === END LIST FUNCTIONS ===/p' "$0")
+        run_list "$DATASET_ARG" "$PROVIDER"
         ;;
     *)
         echo "ERROR: Invalid operation: $OPERATION"
@@ -454,6 +464,16 @@ backup_single_provider() {
     echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Backup complete to $provider_name"
 }
 
+# Check if a backup is complete by looking for shard 100
+is_backup_complete() {
+    local rclone_remote="$1"
+    local dataset_path="$2" 
+    local backup_prefix="$3"
+    
+    local completion_shard="${backup_prefix}-s100.zfs.gz.age"
+    rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep -q "^${completion_shard}$"
+}
+
 # Streaming ZFS backup function - no temp files needed!
 stream_zfs_to_cloud() {
     local prev_snap="$1"
@@ -471,8 +491,16 @@ stream_zfs_to_cloud() {
     local existing_shards=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9].zfs.gz.age$" | sort || true))
     
     if [[ ${#existing_shards[@]} -gt 0 ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Found ${#existing_shards[@]} existing shards - resuming backup"
-        echo "$(date '+%Y-%m-%d %H:%M:%S')       Existing: ${existing_shards[0]} ... ${existing_shards[-1]}"
+        # Check if backup is already complete by looking for shard 100
+        if is_backup_complete "$rclone_remote" "$dataset_path" "$backup_prefix"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Backup already complete: found shard 100 of 100"
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ All ${#existing_shards[@]} shards exist in cloud storage"
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     Skipping backup - already complete"
+            return 0
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     Found ${#existing_shards[@]} existing shards - resuming backup"
+            echo "$(date '+%Y-%m-%d %H:%M:%S')       Existing: ${existing_shards[0]} ... ${existing_shards[-1]}"
+        fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S')     No existing shards found - starting fresh backup"
     fi
@@ -1000,3 +1028,108 @@ run_restore() {
 }
 
 # === END RESTORE FUNCTIONS ===
+
+# === LIST FUNCTIONS ===
+
+run_list() {
+    local dataset_arg="$1"
+    local provider="${2:-all}"
+    
+    echo "=== Offsite Backup List ==="
+    echo ""
+    
+    # Provider selection (same logic as backup)
+    if [[ "$provider" == "all" ]]; then
+        SELECTED_PROVIDERS=($(printf '%s\n' "${\!PROVIDERS[@]}"  < /dev/null |  sort))
+    else
+        case "$provider" in
+            bb) provider="backblaze" ;;
+            scw) provider="scaleway" ;;
+        esac
+        
+        if [[ -z "${PROVIDERS[$provider]:-}" ]]; then
+            echo "ERROR: Unknown provider '$provider'"
+            echo "Available providers: ${\!PROVIDERS[*]}"
+            exit 1
+        fi
+        
+        SELECTED_PROVIDERS=("$provider")
+    fi
+    
+    # List backups for each provider
+    for prov in "${SELECTED_PROVIDERS[@]}"; do
+        rclone_remote="${PROVIDERS[$prov]}"
+        provider_name="${PROVIDER_NAMES[$prov]}"
+        
+        echo "📡 $provider_name ($prov)"
+        echo "─────────────────────────────────────"
+        
+        if [[ -n "$dataset_arg" ]]; then
+            # List specific dataset
+            list_dataset_backups "$rclone_remote" "$dataset_arg"
+        else
+            # List all datasets
+            list_all_backups "$rclone_remote"
+        fi
+        
+        echo ""
+    done
+}
+
+list_dataset_backups() {
+    local rclone_remote="$1"
+    local dataset="$2"
+    local dataset_path="${dataset//\//_}"
+    
+    # Get all backup prefixes for this dataset
+    local backup_files=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep -E "^(full|incr)-.*-s[0-9][0-9][0-9]\.zfs\.gz\.age$" | sort || true))
+    
+    if [[ ${#backup_files[@]} -eq 0 ]]; then
+        echo "  No backups found for $dataset"
+        return
+    fi
+    
+    # Extract unique backup prefixes
+    local backup_prefixes=($(printf '%s\n' "${backup_files[@]}" | sed -E 's/-s[0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u))
+    
+    echo "  Dataset: $dataset"
+    echo ""
+    
+    for prefix in "${backup_prefixes[@]}"; do
+        # Count shards for this backup
+        local shard_count=$(printf '%s\n' "${backup_files[@]}" | grep "^${prefix}-s" | wc -l)
+        
+        # Check if backup is complete (has shard 100)
+        local status="❌ Incomplete"
+        if is_backup_complete "$rclone_remote" "$dataset_path" "$prefix"; then
+            status="✅ Complete"
+        fi
+        
+        # Extract backup info from prefix
+        local backup_type="${prefix%%-*}"
+        local backup_date="${prefix#*-}"
+        
+        echo "    $status $backup_type-$backup_date ($shard_count shards)"
+    done
+}
+
+list_all_backups() {
+    local rclone_remote="$1"
+    
+    # Get all dataset directories
+    local datasets=($(rclone lsd "${rclone_remote}/" 2>/dev/null | awk '{print $NF}' | grep -v "^$" || true))
+    
+    if [[ ${#datasets[@]} -eq 0 ]]; then
+        echo "  No backups found"
+        return
+    fi
+    
+    for dataset_path in "${datasets[@]}"; do
+        # Convert path back to dataset name
+        local dataset="${dataset_path//_//}"
+        list_dataset_backups "$rclone_remote" "$dataset"
+        echo ""
+    done
+}
+
+# === END LIST FUNCTIONS ===
