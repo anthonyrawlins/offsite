@@ -607,16 +607,22 @@ stream_zfs_to_cloud() {
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       Running: dd bs=$dynamic_shard_size_bytes count=1 of=$shard_file"
                 
                 # Read exactly one shard worth of data (with backpressure)
-                if ! dd bs="$dynamic_shard_size_bytes" count=1 of="$shard_file" 2>/dev/null; then
+                local dd_result
+                dd_result=$(dd bs="$dynamic_shard_size_bytes" count=1 of="$shard_file" 2>&1)
+                local dd_exit_code=$?
+                
+                # Get actual size of created file
+                local actual_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       dd result: exit_code=$dd_exit_code, file_size=$actual_size bytes"
+                
+                if [[ $dd_exit_code -ne 0 ]] || [[ $actual_size -eq 0 ]]; then
                     # End of stream or error
-                    if [[ -s "$shard_file" ]]; then
-                        # Partial shard exists, process it
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')       Final partial shard $shard_num created"
-                    else
-                        # No data, clean exit
-                        rm -f "$shard_file"
-                        break
-                    fi
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       End of stream detected (exit_code=$dd_exit_code, size=$actual_size)"
+                    rm -f "$shard_file"
+                    break
+                elif [[ $actual_size -lt $dynamic_shard_size_bytes ]]; then
+                    # Partial shard exists, process it as final shard
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Final partial shard $shard_num created ($actual_size bytes)"
                 fi
                 
                 # Check if this shard already exists in cloud (resumable backup)
@@ -647,9 +653,15 @@ stream_zfs_to_cloud() {
                 
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       Completed shard processing, moving to shard $shard_num"
                 
-                # Exit if we've reached estimated shard count and stream seems complete
-                if [[ $shard_num -gt $estimated_shards ]] && [[ ! -s "$shard_file" ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Reached estimated shard count, stream appears complete"
+                # If this was a partial shard (smaller than expected), we're done
+                if [[ $actual_size -lt $dynamic_shard_size_bytes ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Final shard processed, backup complete"
+                    break
+                fi
+                
+                # Exit if we've reached estimated shard count  
+                if [[ $shard_num -gt $estimated_shards ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Reached estimated shard count ($estimated_shards), backup complete"
                     break
                 fi
             done
