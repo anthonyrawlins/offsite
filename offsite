@@ -15,10 +15,12 @@ OPERATIONS:
   --restore, -r   Restore a ZFS dataset from cloud storage
 
 ZFS-STYLE SYNTAX:
-  dataset               - For backup: create snapshot and backup
+  dataset               - For backup: create auto-timestamped snapshot and backup
                          For restore: restore full dataset state (latest backup)
-  dataset@snapshot      - For backup: backup specific snapshot
+  dataset@snapshot      - For backup: create/use specific snapshot and backup
                          For restore: restore to specific backup point
+  dataset@now           - For backup: create snapshot with timestamp
+  dataset@today         - For backup: create snapshot with date
   dataset@latest        - For restore: same as dataset (ZFS semantics)
   dataset@latest-full   - For restore: most recent full backup only
 
@@ -34,10 +36,11 @@ COMMON OPTIONS:
   --version, -v        Show version information
 
 EXAMPLES:
-  # Backup operations
-  offsite --backup tank/important/data
-  offsite --backup tank/photos@now --provider scaleway
-  offsite --backup tank/docs@backup-$(date +%Y%m%d)
+  # Backup operations (always full backups)
+  offsite --backup tank/important/data                    # Auto-timestamped snapshot
+  offsite --backup tank/photos@now --provider scaleway    # Snapshot with timestamp
+  offsite --backup tank/docs@backup-$(date +%Y%m%d)       # Custom snapshot name
+  offsite --backup tank/projects@today                    # Snapshot with date
   
   # Restore operations
   offsite --restore tank/important/data                 # Restore to original name
@@ -47,6 +50,8 @@ EXAMPLES:
   # Short form (auto-detects operation from context)
   offsite tank/important/data                    # Backup (default operation)
   offsite tank/important/data@latest             # Restore (@ implies restore)
+  
+NOTE: --as flag is only available for restore operations in version 2.0+
 
 PROVIDERS:
   all         - Backup to all configured providers

@@ -224,7 +224,7 @@ if [[ -n "$USER_DATASETS" ]]; then
     echo ""
     echo "Automation (add to crontab for daily backups):"
     for dataset in $USER_DATASETS; do
-        echo "  0 2 * * * offsite --backup $dataset --as @\$(date +%Y%m%d)"
+        echo "  0 2 * * * offsite --backup $dataset@daily-\$(date +%Y%m%d)"
     done
     echo ""
 fi
@@ -244,14 +244,18 @@ else
 fi
 echo ""
 echo "Unified script usage:"
-echo "  Backup:  offsite --backup <dataset> [--as @snapshot] [--provider <name>]"
+echo "  Backup:  offsite --backup <dataset[@snapshot]> [--provider <name>]"
 echo "  Restore: offsite --restore <dataset[@backup]> [--as <target>] [--provider <name>]"
 echo ""
-echo "Examples:"
-echo "  offsite --backup tank/data --as @today"
+echo "Backup examples (always full backups):"
+echo "  offsite --backup tank/data                      # Auto-timestamped snapshot"
+echo "  offsite --backup tank/data@today                # Snapshot with date"
+echo "  offsite --backup tank/data@backup-\$(date +%Y%m%d) # Custom snapshot name"
+echo "  offsite --backup tank/photos --provider scaleway # Specific provider"
+echo ""
+echo "Restore examples:"
 echo "  offsite --restore tank/data                    # Restore to original name"
 echo "  offsite --restore tank/data --as tank/new-data # Restore to new name"
-echo "  offsite --backup tank/photos --provider scaleway"
 echo "  offsite --restore tank/photos@latest-full --as tank/photos-test"
 echo ""
 echo "🔐 IMPORTANT: Save your age private key securely!"
