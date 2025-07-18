@@ -1416,35 +1416,14 @@ run_restore() {
     
     local total_shards=${#sorted_shards[@]}
     
-    # Stream shards sequentially with individual progress bars
-    # This approach maintains stream continuity for ZFS receive
+    # Stream shards sequentially to ZFS receive
     {
-        local shard_index=0
         for entry in "${sorted_shards[@]}"; do
             local shard_file="${entry#*:}"
-            local shard_num=$(printf "%03d" $((shard_index + 1)))
+            echo "    Processing: $shard_file" >&2
             
-            # Get shard size for progress bar
-            local shard_size=$(rclone size "${remote_path}/${shard_file}" 2>/dev/null | grep "Total size:" | sed 's/.*(\([0-9]*\) Bytes).*/\1/')
-            
-            # Progress bar display
-            local progress_name="Shard ${shard_num}/${total_shards}"
-            
-            # Stream with individual progress bar: download → decrypt → decompress
-            if [[ -n "$shard_size" ]] && [[ "$shard_size" -gt 0 ]]; then
-                rclone cat "${remote_path}/${shard_file}" | \
-                    pv -p -t -e -r -s "$shard_size" -N "$progress_name" | \
-                    age -d -i "$AGE_PRIVATE_KEY_FILE" | \
-                    gunzip
-            else
-                # Fallback without size
-                rclone cat "${remote_path}/${shard_file}" | \
-                    pv -p -t -e -r -N "$progress_name" | \
-                    age -d -i "$AGE_PRIVATE_KEY_FILE" | \
-                    gunzip
-            fi
-            
-            ((shard_index++))
+            # Stream: download → decrypt → decompress
+            rclone cat "${remote_path}/${shard_file}" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip
         done
     } | pv -p -t -e -r -B 1M -N "ZFS Receive" | zfs recv -F "$target_dataset"
     
