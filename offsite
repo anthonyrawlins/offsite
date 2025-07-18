@@ -759,8 +759,8 @@ stream_zfs_to_cloud_parallel() {
                 # Only upload if this shard is actually missing
                 if [[ -n "${missing_shard_map[$shard_num]:-}" ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       Creating missing shard $shard_num..."
-                    # Upload this shard to all providers
-                    upload_shard_to_all_providers "$shard_file" "$output_file" "$dataset_path" "$agekey" "$shard_num" &
+                    # Upload this shard to all providers (synchronously for proper backpressure)
+                    upload_shard_to_all_providers "$shard_file" "$output_file" "$dataset_path" "$agekey" "$shard_num"
                 else
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       Shard $shard_num exists on all providers - skipping"
                     rm -f "$shard_file"
