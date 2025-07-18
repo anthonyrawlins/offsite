@@ -237,29 +237,36 @@ run_backup() {
         local dataset="${dataset_arg%@*}"
         local snapshot_spec="${dataset_arg#*@}"
         
-        
-        # Handle special snapshot names
-        case "$snapshot_spec" in
-            today)
-                snapshot_spec="${SNAP_PREFIX}-$(date +%Y%m%d)"
-                ;;
-            now)
-                snapshot_spec="${SNAP_PREFIX}-$(date +%Y%m%d-%H%M%S)"
-                ;;
-        esac
-        
-        # Check if snapshot exists, if not create it
-        if ! zfs list "${dataset}@${snapshot_spec}" >/dev/null 2>&1; then
-            echo "Creating snapshot: ${dataset}@${snapshot_spec}"
-            if ! zfs snapshot "${dataset}@${snapshot_spec}"; then
-                echo "ERROR: Failed to create snapshot"
-                exit 1
+        # First check if the snapshot exists as-is (don't transform existing snapshots)
+        if zfs list "${dataset}@${snapshot_spec}" >/dev/null 2>&1; then
+            # Snapshot exists - use it directly
+            BACKUP_DATASET="$dataset"
+            BACKUP_SNAPSHOT="$snapshot_spec"
+            echo "Using existing snapshot: ${dataset}@${snapshot_spec}"
+        else
+            # Snapshot doesn't exist - handle special names and create if needed
+            case "$snapshot_spec" in
+                today)
+                    snapshot_spec="${SNAP_PREFIX}-$(date +%Y%m%d)"
+                    ;;
+                now)
+                    snapshot_spec="${SNAP_PREFIX}-$(date +%Y%m%d-%H%M%S)"
+                    ;;
+            esac
+            
+            # Check again after transformation
+            if ! zfs list "${dataset}@${snapshot_spec}" >/dev/null 2>&1; then
+                echo "Creating snapshot: ${dataset}@${snapshot_spec}"
+                if ! zfs snapshot "${dataset}@${snapshot_spec}"; then
+                    echo "ERROR: Failed to create snapshot"
+                    exit 1
+                fi
             fi
+            
+            BACKUP_DATASET="$dataset"
+            BACKUP_SNAPSHOT="$snapshot_spec"
+            echo "Backing up snapshot: ${dataset}@${snapshot_spec}"
         fi
-        
-        BACKUP_DATASET="$dataset"
-        BACKUP_SNAPSHOT="$snapshot_spec"
-        echo "Backing up snapshot: ${dataset}@${snapshot_spec}"
     else
         # Create new snapshot
         BACKUP_DATASET="$dataset_arg"
