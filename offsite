@@ -768,13 +768,6 @@ stream_zfs_to_cloud() {
             done
             
             echo "$(date '+%Y-%m-%d %H:%M:%S')     DEBUG: Exited while loop, processed_count=$processed_count"
-                
-                # Exit if we've reached estimated shard count  
-                if [[ $shard_num -gt $estimated_shards ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Reached estimated shard count ($estimated_shards), backup complete"
-                    break
-                fi
-            done
         }
     }
     
