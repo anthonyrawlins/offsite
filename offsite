@@ -608,25 +608,14 @@ stream_zfs_to_cloud() {
                 # Get shard file size for progress bar
                 local shard_size=$(stat -c%s "$expected_shard" 2>/dev/null || echo "0")
                 
-                # Stream shard: compress -> encrypt -> upload with progress bar
-                if command -v pv >/dev/null 2>&1; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading $(numfmt --to=iec $shard_size)..."
-                    if pv -s "$shard_size" "$expected_shard" | gzip | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
-                    else
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
-                        upload_success=false
-                        break
-                    fi
+                # Stream shard: compress -> encrypt -> upload (no progress bar for testing)
+                echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading $(numfmt --to=iec $shard_size)..."
+                if gzip < "$expected_shard" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
                 else
-                    # Fallback without progress bar
-                    if gzip < "$expected_shard" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
-                    else
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
-                        upload_success=false
-                        break
-                    fi
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
+                    upload_success=false
+                    break
                 fi
             fi
             
@@ -653,23 +642,14 @@ stream_zfs_to_cloud() {
         
         echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing final shard..."
         
-        # Stream shard: compress -> encrypt -> upload
-        if command -v pv >/dev/null 2>&1; then
-            local shard_size=$(stat -c%s "$remaining_shard" 2>/dev/null || echo "0")
-            echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading $(numfmt --to=iec $shard_size)..."
-            if pv -s "$shard_size" "$remaining_shard" | gzip | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
-            else
-                echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
-                upload_success=false
-            fi
+        # Stream shard: compress -> encrypt -> upload (no progress bar for testing)
+        local shard_size=$(stat -c%s "$remaining_shard" 2>/dev/null || echo "0")
+        echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading $(numfmt --to=iec $shard_size)..."
+        if gzip < "$remaining_shard" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
         else
-            if gzip < "$remaining_shard" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
-            else
-                echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
-                upload_success=false
-            fi
+            echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
+            upload_success=false
         fi
         
         rm -f "$remaining_shard"
