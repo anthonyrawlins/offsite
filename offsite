@@ -473,34 +473,65 @@ backup_single_provider() {
     echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Backup complete to $provider_name"
 }
 
-# Check if a backup is complete by looking for the final shard (may not be shard 100)
+# Check if a backup is complete by verifying the final shard is smaller than expected
 is_backup_complete() {
     local rclone_remote="$1"
     local dataset_path="$2" 
     local backup_prefix="$3"
     
-    # Get all shards for this backup and find the highest numbered one
-    local all_shards=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9].zfs.gz.age$" | sort))
+    # Get all shards for this backup with size information
+    local shard_list=$(rclone lsf "${rclone_remote}/${dataset_path}/" --format "sp" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9].zfs.gz.age ")
     
-    if [[ ${#all_shards[@]} -eq 0 ]]; then
+    if [[ -z "$shard_list" ]]; then
         return 1  # No shards found
     fi
     
-    # Get the highest shard number
-    local highest_shard="${all_shards[-1]}"
-    local shard_number=$(echo "$highest_shard" | sed -E 's/.*-s([0-9]{3})\.zfs\.gz\.age$/\1/')
+    # Parse shards into array with sizes
+    local all_shards=()
+    local shard_sizes=()
     
-    # For compressed backups, we may have fewer shards than expected
-    # A backup is complete if:
-    # 1. We have exactly 100 shards (original target), OR
-    # 2. We have multiple shards (assuming the last was a final partial shard)
-    # 3. We have just 1 shard but it's very small (entire backup fit in one shard)
+    while IFS= read -r line; do
+        local size=$(echo "$line" | awk '{print $1}')
+        local name=$(echo "$line" | awk '{print $2}')
+        all_shards+=("$name")
+        shard_sizes+=("$size")
+    done <<< "$shard_list"
     
-    if [[ $shard_number == "100" ]] || [[ ${#all_shards[@]} -ge 2 ]]; then
-        return 0  # Complete
+    # Sort by shard number (they should already be sorted, but ensure it)
+    local sorted_indices=($(for i in "${!all_shards[@]}"; do echo "$i ${all_shards[$i]}"; done | sort -k2 | awk '{print $1}'))
+    
+    local shard_count=${#all_shards[@]}
+    
+    if [[ $shard_count -eq 0 ]]; then
+        return 1  # No shards
+    elif [[ $shard_count -eq 1 ]]; then
+        # Single shard - check if it's shard 100 (complete) or very small (single-shard backup)
+        local shard_name="${all_shards[0]}"
+        local shard_number=$(echo "$shard_name" | sed -E 's/.*-s([0-9]{3})\.zfs\.gz\.age$/\1/')
+        
+        if [[ $shard_number == "100" ]]; then
+            return 0  # Reached target shard 100
+        else
+            # Single non-100 shard - assume incomplete for safety
+            return 1
+        fi
     else
-        # Single shard - need to check if it's a complete small backup
-        return 1  # Incomplete for now
+        # Multiple shards - check if final shard is significantly smaller
+        local last_idx=${sorted_indices[-1]}
+        local second_last_idx=${sorted_indices[-2]}
+        
+        local final_size=${shard_sizes[$last_idx]}
+        local previous_size=${shard_sizes[$second_last_idx]}
+        
+        # Consider complete if final shard is less than 50% of previous shard size
+        # This accounts for compression variations while detecting true partial shards
+        local size_threshold=$((previous_size / 2))
+        
+        if [[ $final_size -lt $size_threshold ]]; then
+            return 0  # Final shard is significantly smaller - backup complete
+        else
+            return 1  # All shards similar size - likely incomplete
+        fi
     fi
 }
 
