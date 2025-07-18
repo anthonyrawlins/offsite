@@ -581,10 +581,6 @@ stream_zfs_to_cloud() {
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Checking for existing shards..."
     local existing_shards=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" | sort || true))
     
-    # Calculate byte offset for resume
-    local bytes_to_skip=0
-    local shard_num=1
-    
     if [[ ${#existing_shards[@]} -gt 0 ]]; then
         # Check if backup is already complete
         if is_backup_complete "$rclone_remote" "$dataset_path" "$backup_prefix"; then
@@ -595,56 +591,9 @@ stream_zfs_to_cloud() {
         else
             echo "$(date '+%Y-%m-%d %H:%M:%S')     Found ${#existing_shards[@]} existing shards - resuming backup"
             echo "$(date '+%Y-%m-%d %H:%M:%S')       Existing: ${existing_shards[0]} ... ${existing_shards[-1]}"
-            
-            # Extract byte offsets from existing shard filenames and find the highest
-            local highest_offset=0
-            local highest_shard_num=0
-            
-            for shard in "${existing_shards[@]}"; do
-                # Extract byte offset from filename: backup_prefix-s###-b##########.zfs.gz.age
-                local offset=$(echo "$shard" | sed -E 's/.*-b([0-9]{10})\.zfs\.gz\.age$/\1/' | sed 's/^0*//')
-                local shard_number=$(echo "$shard" | sed -E 's/.*-s([0-9]{3})-b[0-9]{10}\.zfs\.gz\.age$/\1/' | sed 's/^0*//')
-                
-                # Handle empty offset (if sed fails)
-                [[ -z "$offset" ]] && offset=0
-                [[ -z "$shard_number" ]] && shard_number=1
-                
-                if [[ $offset -gt $highest_offset ]]; then
-                    highest_offset=$offset
-                    highest_shard_num=$shard_number
-                fi
-            done
-            
-            # Get the actual size of the last shard from cloud storage
-            # We need to know how many raw bytes it contained to calculate resume position correctly
-            echo "$(date '+%Y-%m-%d %H:%M:%S')     Getting actual size of last shard for precise resume..."
-            
-            # Find the last shard file name
-            local last_shard_file=""
-            for shard in "${existing_shards[@]}"; do
-                local offset=$(echo "$shard" | sed -E 's/.*-b([0-9]{10})\.zfs\.gz\.age$/\1/' | sed 's/^0*//')
-                [[ -z "$offset" ]] && offset=0
-                if [[ $offset -eq $highest_offset ]]; then
-                    last_shard_file="$shard"
-                    break
-                fi
-            done
-            
-            # For now, estimate the last shard size as dynamic_shard_size_bytes
-            # TODO: This is still an approximation - ideally we'd track actual raw bytes
-            # But since ZFS streams are deterministic, this should work for most cases
-            local estimated_last_shard_size=$dynamic_shard_size_bytes
-            
-            # Resume from the next position after the highest shard
-            bytes_to_skip=$((highest_offset + estimated_last_shard_size))
-            shard_num=$((highest_shard_num + 1))
-            
-            echo "$(date '+%Y-%m-%d %H:%M:%S')     Resuming from byte offset: $bytes_to_skip (shard $shard_num)"
         fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S')     No existing shards found - starting fresh backup"
-        bytes_to_skip=0
-        shard_num=1
     fi
     
     # Create the zfs send command - always full
@@ -726,9 +675,46 @@ stream_zfs_to_cloud() {
     # Create a custom streaming pipeline with controlled backpressure
     {
         eval "$zfs_cmd" | {
-            # Skip bytes for existing shards (resumable backup)
+            # Calculate byte offset for resume (moved inside subshell to fix variable scoping)
+            local bytes_to_skip=0
+            local shard_num=1
             local current_byte_offset=0
             
+            if [[ ${#existing_shards[@]} -gt 0 ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S')     Calculating resume position from existing shards..."
+                
+                # Extract byte offsets from existing shard filenames and find the highest
+                local highest_offset=0
+                local highest_shard_num=0
+                
+                for shard in "${existing_shards[@]}"; do
+                    # Extract byte offset from filename: backup_prefix-s###-b##########.zfs.gz.age
+                    local offset=$(echo "$shard" | sed -E 's/.*-b([0-9]{10})\.zfs\.gz\.age$/\1/' | sed 's/^0*//')
+                    local shard_number=$(echo "$shard" | sed -E 's/.*-s([0-9]{3})-b[0-9]{10}\.zfs\.gz\.age$/\1/' | sed 's/^0*//')
+                    
+                    # Handle empty offset (if sed fails)
+                    [[ -z "$offset" ]] && offset=0
+                    [[ -z "$shard_number" ]] && shard_number=1
+                    
+                    if [[ $offset -gt $highest_offset ]]; then
+                        highest_offset=$offset
+                        highest_shard_num=$shard_number
+                    fi
+                done
+                
+                # For now, estimate the last shard size as dynamic_shard_size_bytes
+                # TODO: This is still an approximation - ideally we'd track actual raw bytes
+                # But since ZFS streams are deterministic, this should work for most cases
+                local estimated_last_shard_size=$dynamic_shard_size_bytes
+                
+                # Resume from the next position after the highest shard
+                bytes_to_skip=$((highest_offset + estimated_last_shard_size))
+                shard_num=$((highest_shard_num + 1))
+                
+                echo "$(date '+%Y-%m-%d %H:%M:%S')     Resuming from byte offset: $bytes_to_skip (shard $shard_num)"
+            fi
+            
+            # Skip bytes for resuming
             if [[ $bytes_to_skip -gt 0 ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S')     Skipping $bytes_to_skip bytes to resume from shard $shard_num"
                 # Use more efficient skipping with larger block sizes
