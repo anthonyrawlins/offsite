@@ -1416,38 +1416,14 @@ run_restore() {
     
     local total_shards=${#sorted_shards[@]}
     
-    # Stream shards directly to ZFS receive with pipeline preview
+    # Stream shards directly to ZFS receive - minimal approach
     {
-        local shard_index=0
-        
-        # Show pipeline preview - what the next few shards will look like
-        echo "    Pipeline preview:" >&2
-        for ((i=0; i<5 && i<total_shards; i++)); do
-            local entry="${sorted_shards[$i]}"
-            local shard_file="${entry#*:}"
-            local shard_num=$(printf "%03d" $((i + 1)))
-            
-            case $i in
-                0) echo "    Processing: $shard_file ⬇️  🔐  📦  ➡️  ✅" >&2 ;;
-                1) echo "    Processing: $shard_file ⬇️  🔐  📦  ➡️  " >&2 ;;
-                2) echo "    Processing: $shard_file ⬇️  🔐  📦  " >&2 ;;
-                3) echo "    Processing: $shard_file ⬇️  🔐  " >&2 ;;
-                4) echo "    Processing: $shard_file ⬇️  " >&2 ;;
-            esac
-        done
-        echo "" >&2
-        
-        # Process each shard
         for entry in "${sorted_shards[@]}"; do
             local shard_file="${entry#*:}"
-            local shard_num=$(printf "%03d" $((shard_index + 1)))
+            echo "    Processing: $shard_file" >&2
             
-            echo "    $shard_num: $shard_file" >&2
-            
-            # Direct streaming: download → decrypt → decompress
+            # Stream: download → decrypt → decompress
             rclone cat "${remote_path}/${shard_file}" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip
-            
-            ((shard_index++))
         done
     } | zfs recv -F "$target_dataset"
     
