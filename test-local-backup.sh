@@ -21,6 +21,14 @@ cat > "$TEMP_RCLONE_CONFIG" << EOF
 [localtest]
 type = local
 nounc = true
+
+[cloudremote]
+type = local
+nounc = true
+
+[scaleway] 
+type = local
+nounc = true
 EOF
 
 echo "Temporary rclone config: $TEMP_RCLONE_CONFIG"
@@ -42,6 +50,15 @@ B2_KEY_ID="test"
 B2_APPLICATION_KEY="test"  
 B2_BUCKET_NAME="test-bucket"
 RCLONE_REMOTE="localtest:$LOCAL_DIR/zfs-backups"
+
+# Override Scaleway to use local as well
+SCW_ACCESS_KEY="test"
+SCW_SECRET_KEY="test"
+SCALEWAY_REMOTE="localtest:$LOCAL_DIR/zfs-backups"
+
+# Encryption key
+AGE_PUBLIC_KEY_FILE="$HOME/.config/age/zfs-backup.pub"
+AGE_PRIVATE_KEY_FILE="$HOME/.config/age/zfs-backup.txt"
 EOF
 
 echo "Temporary config: $TEMP_CONFIG"
@@ -57,8 +74,9 @@ run_local_backup() {
     
     cp "$TEMP_CONFIG" ~/.config/offsite/config.env
     
-    # Run the backup (should use local storage)
-    if ./offsite --backup "${TEST_DATASET}@${TEST_SNAPSHOT}"; then
+    # Run the backup with only local provider to avoid connection issues
+    echo "Running: ./offsite --backup ${TEST_DATASET}@${TEST_SNAPSHOT} --provider backblaze"
+    if ./offsite --backup "${TEST_DATASET}@${TEST_SNAPSHOT}" --provider backblaze; then
         echo "✓ Local backup completed"
         BACKUP_SUCCESS=true
     else
