@@ -1416,16 +1416,76 @@ run_restore() {
     
     local total_shards=${#sorted_shards[@]}
     
-    # Stream shards directly to ZFS receive - minimal approach
+    # Stream shards with 5-ahead parallel processing using named pipes
+    local pipeline_buffer_size=5
+    local pipe_dir="$work_dir/pipes"
+    mkdir -p "$pipe_dir"
+    
     {
-        for entry in "${sorted_shards[@]}"; do
+        local consume_index=0
+        local download_index=0
+        local download_pids=()
+        local shard_pipes=()
+        
+        # Create named pipes for decrypted data
+        for ((i=0; i<pipeline_buffer_size; i++)); do
+            local pipe_path="$pipe_dir/shard_$i"
+            mkfifo "$pipe_path"
+            shard_pipes[$i]="$pipe_path"
+        done
+        
+        # Function to start processing a shard in background
+        start_shard_processing() {
+            local shard_index="$1"
+            local pipe_index="$2"
+            local entry="${sorted_shards[$shard_index]}"
             local shard_file="${entry#*:}"
+            local pipe_path="${shard_pipes[$pipe_index]}"
+            
             echo "    Processing: $shard_file" >&2
             
-            # Stream: download → decrypt → decompress
-            rclone cat "${remote_path}/${shard_file}" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip
+            # Download, decrypt, decompress in background to named pipe
+            {
+                rclone cat "${remote_path}/${shard_file}" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip > "$pipe_path"
+            } &
+            
+            echo $!  # Return PID
+        }
+        
+        # Start initial pipeline buffer
+        for ((i=0; i<pipeline_buffer_size && i<total_shards; i++)); do
+            local pipe_index=$((i % pipeline_buffer_size))
+            local pid=$(start_shard_processing "$i" "$pipe_index")
+            download_pids[$i]=$pid
+            ((download_index++))
         done
+        
+        # Consume shards in order
+        while [[ $consume_index -lt $total_shards ]]; do
+            local pipe_index=$((consume_index % pipeline_buffer_size))
+            local pipe_path="${shard_pipes[$pipe_index]}"
+            local pid=${download_pids[$consume_index]}
+            
+            # Wait for this shard to complete
+            wait $pid
+            
+            # Stream the decrypted data to ZFS receive
+            cat "$pipe_path"
+            
+            # Start next shard if more remain
+            if [[ $download_index -lt $total_shards ]]; then
+                local next_pid=$(start_shard_processing "$download_index" "$pipe_index")
+                download_pids[$download_index]=$next_pid
+                ((download_index++))
+            fi
+            
+            ((consume_index++))
+        done
+        
     } | zfs recv -F "$target_dataset"
+    
+    # Clean up pipes
+    rm -rf "$pipe_dir"
     
     local zfs_recv_result=$?
     
