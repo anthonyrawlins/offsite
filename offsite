@@ -660,8 +660,6 @@ stream_zfs_to_cloud() {
     # True streaming approach with backpressure control
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting true streaming backup with backpressure..."
     
-    local upload_success=true
-    
     # Calculate bytes to skip for resumable backup
     local bytes_to_skip=0
     if [[ ${#existing_shards[@]} -gt 0 ]]; then
@@ -678,6 +676,7 @@ stream_zfs_to_cloud() {
             local shard_num=1
             local current_byte_offset=0
             local processed_count=0
+            local upload_success=true
             
             if [[ ${#existing_shards[@]} -gt 0 ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S')     Calculating resume position from existing shards..."
@@ -812,10 +811,9 @@ stream_zfs_to_cloud() {
                         echo "$(date '+%Y-%m-%d %H:%M:%S')         DEBUG: Upload successful"
                     else
                         echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')         DEBUG: Upload failed, breaking from loop"
-                        upload_success=false
+                        echo "$(date '+%Y-%m-%d %H:%M:%S')         DEBUG: Upload failed, exiting with error"
                         rm -f "$shard_file"
-                        break
+                        exit 1
                     fi
                 fi
                 
@@ -856,11 +854,13 @@ stream_zfs_to_cloud() {
     trap - EXIT  # Remove trap first
     cleanup_temp_files
     
-    if [[ "$upload_success" == "true" ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming backup complete: $processed_count shards uploaded"
+    # Check the exit code from the streaming pipeline
+    local pipeline_exit_code=$?
+    if [[ $pipeline_exit_code -eq 0 ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming backup complete"
         return 0
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✗ Backup failed (upload success: $upload_success)"
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✗ Backup failed (pipeline exit code: $pipeline_exit_code)"
         return 1
     fi
 }
