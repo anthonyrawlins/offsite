@@ -41,13 +41,18 @@ export RCLONE_CONFIG_CLEANUP_B2_ACCOUNT="$B2_KEY_ID"
 export RCLONE_CONFIG_CLEANUP_B2_KEY="$B2_APPLICATION_KEY"
 
 # Configure rclone for Scaleway (if available)
-if [[ -n "${SCW_ACCESS_KEY:-}" ]] && [[ -n "${SCW_SECRET_KEY:-}" ]] && [[ -n "${SCW_BUCKET_NAME:-}" ]]; then
+if [[ -n "${SCW_ACCESS_KEY:-}" ]] && [[ -n "${SCW_SECRET_KEY:-}" ]] && [[ -n "${SCALEWAY_REMOTE:-}" ]]; then
     export RCLONE_CONFIG_CLEANUP_SCW_TYPE="s3"
     export RCLONE_CONFIG_CLEANUP_SCW_PROVIDER="Scaleway"
     export RCLONE_CONFIG_CLEANUP_SCW_ACCESS_KEY_ID="$SCW_ACCESS_KEY"
     export RCLONE_CONFIG_CLEANUP_SCW_SECRET_ACCESS_KEY="$SCW_SECRET_KEY"
     export RCLONE_CONFIG_CLEANUP_SCW_ENDPOINT="s3.fr-par.scw.cloud"
+    
+    # Extract bucket name from SCALEWAY_REMOTE (format: scaleway:bucket/path)
+    SCW_BUCKET_NAME=$(echo "$SCALEWAY_REMOTE" | sed 's/scaleway:\([^/]*\).*/\1/')
+    
     SCALEWAY_AVAILABLE=true
+    echo "  ✓ Scaleway: $SCW_BUCKET_NAME"
 else
     echo "Note: Scaleway configuration not found, will only clean Backblaze"
     SCALEWAY_AVAILABLE=false
@@ -55,9 +60,7 @@ fi
 
 echo "Available providers:"
 echo "  ✓ Backblaze B2: $B2_BUCKET_NAME"
-if [[ "$SCALEWAY_AVAILABLE" == "true" ]]; then
-    echo "  ✓ Scaleway: $SCW_BUCKET_NAME"
-fi
+# Note: Scaleway status already printed above
 echo ""
 
 # Function to list and delete shards from a provider
