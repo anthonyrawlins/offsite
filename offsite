@@ -561,11 +561,10 @@ stream_zfs_to_cloud() {
     local temp_dir=$(mktemp -d)
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Temp directory: $temp_dir"
     
-    # Cleanup function
+    # Cleanup function - but don't trap it yet (let split complete first)
     cleanup_temp_files() {
         rm -rf "$temp_dir" 2>/dev/null || true
     }
-    trap cleanup_temp_files EXIT
     
     # Use a more direct approach: monitor split output directory and process shards as they complete
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting streaming split and upload pipeline..."
@@ -573,6 +572,9 @@ stream_zfs_to_cloud() {
     # Start split in background but monitor for complete shards
     eval "$zfs_cmd" | split -b "$dynamic_shard_size_bytes" --numeric-suffixes=1 --suffix-length=3 - "$temp_dir/shard-" &
     local split_pid=$!
+    
+    # Only set trap after split is running to avoid interfering with it
+    trap cleanup_temp_files EXIT
     
     local shard_num=1
     local processed_count=0
@@ -629,36 +631,43 @@ stream_zfs_to_cloud() {
         fi
     done
     
-    # Wait for split to complete
+    # Wait for split to complete and check its exit status
     wait $split_pid
     split_exit_code=$?
     
-    # Process any remaining shards that split created after our last check
-    for remaining_shard in "$temp_dir"/shard-*; do
-        [[ -f "$remaining_shard" ]] || continue
-        
-        local remaining_suffix=$(basename "$remaining_shard" | sed 's/shard-//')
-        local output_file="${backup_prefix}-s${remaining_suffix}.zfs.gz.age"
-        
-        echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing final shard..."
-        
-        # Stream shard: compress -> encrypt -> upload (no progress bar for testing)
-        local shard_size=$(stat -c%s "$remaining_shard" 2>/dev/null || echo "0")
-        echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading $(numfmt --to=iec $shard_size)..."
-        if gzip < "$remaining_shard" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
-        else
-            echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
-            upload_success=false
-        fi
-        
-        rm -f "$remaining_shard"
-        ((processed_count++))
-    done
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Split process completed with exit code: $split_exit_code"
     
-    # Clean up temp directory
+    if [[ $split_exit_code -ne 0 ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✗ Split process failed with exit code $split_exit_code"
+        upload_success=false
+    else
+        # Process any remaining shards that split created after our last check
+        for remaining_shard in "$temp_dir"/shard-*; do
+            [[ -f "$remaining_shard" ]] || continue
+            
+            local remaining_suffix=$(basename "$remaining_shard" | sed 's/shard-//')
+            local output_file="${backup_prefix}-s${remaining_suffix}.zfs.gz.age"
+            
+            echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing final shard..."
+            
+            # Stream shard: compress -> encrypt -> upload (no progress bar for testing)
+            local shard_size=$(stat -c%s "$remaining_shard" 2>/dev/null || echo "0")
+            echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading $(numfmt --to=iec $shard_size)..."
+            if gzip < "$remaining_shard" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
+            else
+                echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
+                upload_success=false
+            fi
+            
+            rm -f "$remaining_shard"
+            ((processed_count++))
+        done
+    fi
+    
+    # Clean up temp directory only after everything is done
+    trap - EXIT  # Remove trap first
     cleanup_temp_files
-    trap - EXIT
     
     if [[ "$upload_success" == "true" ]] && [[ $split_exit_code -eq 0 ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming backup complete: $processed_count shards uploaded"
