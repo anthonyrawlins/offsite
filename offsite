@@ -461,8 +461,10 @@ backup_single_provider() {
     
     # Always do full backup
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Full backup"
-    local prefix="full"
-    local backup_prefix="${prefix}-${snap}"
+    
+    # Create backup prefix with full dataset@snapshot info: rust/test@now -> rust_test:now
+    local dataset_clean="${dataset//\//_}"  # rust/test -> rust_test
+    local backup_prefix="${dataset_clean}:${snap}"  # rust_test:now
     
     stream_zfs_to_cloud "" "${dataset}@${snap}" "$backup_prefix" "$rclone_remote" "$dataset_path" "$agekey" "full"
     
