@@ -720,7 +720,6 @@ stream_zfs_to_cloud() {
                 local skip_count=$((bytes_to_skip / skip_block_size))
                 local skip_remaining=$((bytes_to_skip % skip_block_size))
                 
-                echo "$(date '+%Y-%m-%d %H:%M:%S')     DEBUG: Skipping $skip_count blocks of $skip_block_size bytes + $skip_remaining remaining"
                 
                 if [[ $skip_count -gt 0 ]]; then
                     dd bs="$skip_block_size" count="$skip_count" iflag=fullblock of=/dev/null 2>/dev/null
@@ -732,18 +731,12 @@ stream_zfs_to_cloud() {
             fi
             
             while true; do
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Starting loop iteration for shard $shard_num"
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Current state - offset: $current_byte_offset, processed: $processed_count"
                 
                 local shard_file="$temp_dir/shard-$(printf "%03d" "$shard_num")"
                 local output_file="${backup_prefix}-s$(printf "%03d" "$shard_num")-b$(printf "%010d" "$current_byte_offset").zfs.gz.age"
                 
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       Creating shard $shard_num..."
                 
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: dynamic_shard_size_bytes=$dynamic_shard_size_bytes"
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       Running: head -c $dynamic_shard_size_bytes > $shard_file"
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Pipeline status before head: ${PIPESTATUS[*]}"
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Current shell process: $$"
                 
                 # Read exactly one shard worth of data (with backpressure)
                 # head -c is simpler and more reliable than dd for exact byte counts
@@ -751,12 +744,9 @@ stream_zfs_to_cloud() {
                 head_result=$(head -c "$dynamic_shard_size_bytes" > "$shard_file" 2>&1)
                 local head_exit_code=$?
                 
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: head raw output: $head_result"
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Pipeline status after head: ${PIPESTATUS[*]}"
                 
                 # Get actual size of created file
                 local actual_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       head result: exit_code=$head_exit_code, file_size=$actual_size bytes"
                 
                 # Check if shard file was actually created
                 if [[ ! -f "$shard_file" ]]; then
@@ -767,75 +757,52 @@ stream_zfs_to_cloud() {
                 if [[ $head_exit_code -ne 0 ]] || [[ $actual_size -eq 0 ]]; then
                     # End of stream or error
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       End of stream detected (exit_code=$head_exit_code, size=$actual_size)"
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Breaking from while loop at shard $shard_num"
                     rm -f "$shard_file"
                     break
                 elif [[ $actual_size -lt $dynamic_shard_size_bytes ]]; then
                     # Partial shard exists, process it as final shard
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       Final partial shard $shard_num created ($actual_size bytes)"
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: This should be the last shard"
                 fi
                 
                 # Check if this shard already exists in cloud (resumable backup)
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Checking if shard already exists: $output_file"
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Existing shards array has ${#existing_shards[@]} items"
                 if printf '%s\n' "${existing_shards[@]}" | grep -q "^${output_file}$"; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       ✓ Shard $shard_num already exists: $output_file"
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Skipping upload for existing shard"
                 else
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing shard $shard_num..."
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Starting upload process for new shard"
                     
                     # Get shard file size
                     local shard_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
                     echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading $(numfmt --to=iec $shard_size)..."
                     
                     # Stream shard: compress -> encrypt -> progress -> upload
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')         DEBUG: Starting rclone upload pipeline"
-                    # Note: pv size estimate may be off due to compression, but shows upload progress
                     if gzip < "$shard_file" | age -r "$agekey" | pv -p -t -e -r -B 1M -N "Shard $shard_num" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
                         echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')         DEBUG: Upload successful"
                     else
                         echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')         DEBUG: Upload failed, exiting with error"
                         rm -f "$shard_file"
                         exit 1
                     fi
                 fi
                 
                 # Clean up temp file immediately after processing (true streaming!)
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Cleaning up temp file: $shard_file"
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: actual_size before cleanup: $actual_size"
                 rm -f "$shard_file"
                 processed_count=$((processed_count + 1))
                 
                 # Update byte offset and shard number for next iteration
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: actual_size after cleanup: $actual_size"
                 current_byte_offset=$((current_byte_offset + actual_size))
                 shard_num=$((shard_num + 1))
-                
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       Completed shard processing, moving to shard $shard_num"
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: processed_count=$processed_count, shard_num=$shard_num, next_offset=$current_byte_offset"
                 
                 # Only break if this is a significantly small shard (< 10% of expected)
                 # A shard that's 80-90% of expected size is still valid data
                 local min_shard_threshold=$((dynamic_shard_size_bytes / 10))  # 10% of expected
                 if [[ $actual_size -lt $min_shard_threshold ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       Tiny shard detected ($actual_size bytes < $min_shard_threshold threshold)"
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Breaking from loop due to very small shard"
                     break
                 elif [[ $actual_size -lt $dynamic_shard_size_bytes ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       Partial shard but continuing ($actual_size of $dynamic_shard_size_bytes expected)"
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Shard is smaller but not tiny, continuing backup"
                 fi
-                
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Continuing to next iteration of while loop"
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: About to loop back for shard $shard_num"
             done
             
-            echo "$(date '+%Y-%m-%d %H:%M:%S')     DEBUG: Exited while loop, processed_count=$processed_count"
-            echo "$(date '+%Y-%m-%d %H:%M:%S')     DEBUG: Final pipeline status: ${PIPESTATUS[*]}"
         }
     }
     
