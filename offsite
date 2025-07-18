@@ -1423,18 +1423,18 @@ run_restore() {
             echo -n "    Processing: $shard_file" >&2
             
             # Stream: download → decrypt → decompress
-            echo -n " 📡" >&2  # Download
+            echo -n " ⬇️" >&2  # Download
             rclone cat "${remote_path}/${shard_file}" | {
-                echo -n " 🔓" >&2  # Decrypt
+                echo -n " 🔐" >&2  # Decrypt
                 age -d -i "$AGE_PRIVATE_KEY_FILE" | {
                     echo -n " 📦" >&2  # Decompress
                     gunzip | {
-                        echo -n " 📤" >&2  # Stream
+                        echo -n " ➡️" >&2  # Stream
                         cat
                     }
                 }
             }
-            echo " ✓" >&2  # Complete
+            echo " ✅" >&2  # Complete
         done
     } | zfs recv -F "$target_dataset"
     
