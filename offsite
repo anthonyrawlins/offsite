@@ -660,8 +660,6 @@ stream_zfs_to_cloud() {
     # True streaming approach with backpressure control
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting true streaming backup with backpressure..."
     
-    local shard_num=1
-    local processed_count=0
     local upload_success=true
     
     # Calculate bytes to skip for resumable backup
@@ -679,6 +677,7 @@ stream_zfs_to_cloud() {
             local bytes_to_skip=0
             local shard_num=1
             local current_byte_offset=0
+            local processed_count=0
             
             if [[ ${#existing_shards[@]} -gt 0 ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S')     Calculating resume position from existing shards..."
