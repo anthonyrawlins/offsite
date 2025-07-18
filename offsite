@@ -1472,23 +1472,23 @@ list_dataset_backups() {
     local dataset="$2"
     local dataset_path="${dataset//\//_}"
     
-    # Get all backup prefixes for this dataset
-    local backup_files=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep -E "^(full|incr)-.*-s[0-9][0-9][0-9]\.zfs\.gz\.age$" | sort || true))
+    # Get all backup prefixes for this dataset (new byte offset format)
+    local backup_files=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep -E "^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$" | sort || true))
     
     if [[ ${#backup_files[@]} -eq 0 ]]; then
         echo "  No backups found for $dataset"
         return
     fi
     
-    # Extract unique backup prefixes
-    local backup_prefixes=($(printf '%s\n' "${backup_files[@]}" | sed -E 's/-s[0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u))
+    # Extract unique backup prefixes (remove shard suffix from new format)
+    local backup_prefixes=($(printf '%s\n' "${backup_files[@]}" | sed -E 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u))
     
     echo "  Dataset: $dataset"
     echo ""
     
     for prefix in "${backup_prefixes[@]}"; do
-        # Count shards for this backup
-        local shard_count=$(printf '%s\n' "${backup_files[@]}" | grep "^${prefix}-s" | wc -l)
+        # Count shards for this backup (new byte offset format)
+        local shard_count=$(printf '%s\n' "${backup_files[@]}" | grep "^${prefix}-s[0-9][0-9][0-9]-b" | wc -l)
         
         # Check if backup is complete (has shard 100)
         local status="❌ Incomplete"
