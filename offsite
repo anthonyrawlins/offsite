@@ -566,14 +566,15 @@ stream_zfs_to_cloud() {
     local shard_pipe="$pipe_dir/shard_pipe"
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Temp directory: $pipe_dir"
     
-    # Set up cleanup trap for interruptions
+    # Set up cleanup trap for interruptions (but don't interfere with child processes)
     cleanup_temp_files() {
         echo "$(date '+%Y-%m-%d %H:%M:%S')     Cleaning up temp files due to interruption..."
         kill $split_pid 2>/dev/null || true
         rm -rf "$pipe_dir"
         exit 1
     }
-    trap cleanup_temp_files INT TERM
+    # Only trap EXIT to avoid interfering with zfs send process
+    trap "cleanup_temp_files" EXIT
     
     # Create named pipe for streaming
     mkfifo "$shard_pipe"
