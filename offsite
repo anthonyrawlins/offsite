@@ -640,8 +640,9 @@ stream_zfs_to_cloud() {
             ((shard_num++))
         else
             # No shard ready yet, wait a bit
-            echo "$(date '+%Y-%m-%d %H:%M:%S')     Waiting for shard $shard_num (split PID $split_pid active: $(kill -0 $split_pid 2>/dev/null && echo 'yes' || echo 'no'))"
-            sleep 0.1
+            local temp_files=($(ls "$temp_dir"/shard-* 2>/dev/null || echo "none"))
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     Waiting for shard $shard_num (split PID $split_pid active: $(kill -0 $split_pid 2>/dev/null && echo 'yes' || echo 'no'), temp files: ${temp_files[*]})"
+            sleep 1
         fi
     done
     
