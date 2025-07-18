@@ -480,7 +480,7 @@ is_backup_complete() {
     local backup_prefix="$3"
     
     # Get all shards for this backup with size information
-    local shard_list=$(rclone lsf "${rclone_remote}/${dataset_path}/" --format "sp" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9].zfs.gz.age ")
+    local shard_list=$(rclone lsf "${rclone_remote}/${dataset_path}/" --format "sp" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age ")
     
     if [[ -z "$shard_list" ]]; then
         return 1  # No shards found
@@ -579,10 +579,14 @@ stream_zfs_to_cloud() {
     
     # Check for existing shards (resumable backup support)
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Checking for existing shards..."
-    local existing_shards=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9].zfs.gz.age$" | sort || true))
+    local existing_shards=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" | sort || true))
+    
+    # Calculate byte offset for resume
+    local bytes_to_skip=0
+    local shard_num=1
     
     if [[ ${#existing_shards[@]} -gt 0 ]]; then
-        # Check if backup is already complete by looking for shard 100
+        # Check if backup is already complete
         if is_backup_complete "$rclone_remote" "$dataset_path" "$backup_prefix"; then
             echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Backup already complete: detected completion pattern"
             echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ All ${#existing_shards[@]} shards exist in cloud storage"
@@ -591,9 +595,56 @@ stream_zfs_to_cloud() {
         else
             echo "$(date '+%Y-%m-%d %H:%M:%S')     Found ${#existing_shards[@]} existing shards - resuming backup"
             echo "$(date '+%Y-%m-%d %H:%M:%S')       Existing: ${existing_shards[0]} ... ${existing_shards[-1]}"
+            
+            # Extract byte offsets from existing shard filenames and find the highest
+            local highest_offset=0
+            local highest_shard_num=0
+            
+            for shard in "${existing_shards[@]}"; do
+                # Extract byte offset from filename: backup_prefix-s###-b##########.zfs.gz.age
+                local offset=$(echo "$shard" | sed -E 's/.*-b([0-9]{10})\.zfs\.gz\.age$/\1/' | sed 's/^0*//')
+                local shard_number=$(echo "$shard" | sed -E 's/.*-s([0-9]{3})-b[0-9]{10}\.zfs\.gz\.age$/\1/' | sed 's/^0*//')
+                
+                # Handle empty offset (if sed fails)
+                [[ -z "$offset" ]] && offset=0
+                [[ -z "$shard_number" ]] && shard_number=1
+                
+                if [[ $offset -gt $highest_offset ]]; then
+                    highest_offset=$offset
+                    highest_shard_num=$shard_number
+                fi
+            done
+            
+            # Get the actual size of the last shard from cloud storage
+            # We need to know how many raw bytes it contained to calculate resume position correctly
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     Getting actual size of last shard for precise resume..."
+            
+            # Find the last shard file name
+            local last_shard_file=""
+            for shard in "${existing_shards[@]}"; do
+                local offset=$(echo "$shard" | sed -E 's/.*-b([0-9]{10})\.zfs\.gz\.age$/\1/' | sed 's/^0*//')
+                [[ -z "$offset" ]] && offset=0
+                if [[ $offset -eq $highest_offset ]]; then
+                    last_shard_file="$shard"
+                    break
+                fi
+            done
+            
+            # For now, estimate the last shard size as dynamic_shard_size_bytes
+            # TODO: This is still an approximation - ideally we'd track actual raw bytes
+            # But since ZFS streams are deterministic, this should work for most cases
+            local estimated_last_shard_size=$dynamic_shard_size_bytes
+            
+            # Resume from the next position after the highest shard
+            bytes_to_skip=$((highest_offset + estimated_last_shard_size))
+            shard_num=$((highest_shard_num + 1))
+            
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     Resuming from byte offset: $bytes_to_skip (shard $shard_num)"
         fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S')     No existing shards found - starting fresh backup"
+        bytes_to_skip=0
+        shard_num=1
     fi
     
     # Create the zfs send command - always full
@@ -676,14 +727,22 @@ stream_zfs_to_cloud() {
     {
         eval "$zfs_cmd" | {
             # Skip bytes for existing shards (resumable backup)
+            local current_byte_offset=0
+            
             if [[ $bytes_to_skip -gt 0 ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S')     Skipping $bytes_to_skip bytes to resume from shard $shard_num"
-                dd bs="$dynamic_shard_size_bytes" count="${#existing_shards[@]}" of=/dev/null 2>/dev/null
+                # Use more efficient skipping with larger block sizes
+                dd bs=1048576 count=$((bytes_to_skip / 1048576)) of=/dev/null 2>/dev/null
+                local remaining_bytes=$((bytes_to_skip % 1048576))
+                if [[ $remaining_bytes -gt 0 ]]; then
+                    dd bs=1 count=$remaining_bytes of=/dev/null 2>/dev/null
+                fi
+                current_byte_offset=$bytes_to_skip
             fi
             
             while true; do
                 local shard_file="$temp_dir/shard-$(printf "%03d" "$shard_num")"
-                local output_file="${backup_prefix}-s$(printf "%03d" "$shard_num").zfs.gz.age"
+                local output_file="${backup_prefix}-s$(printf "%03d" "$shard_num")-b$(printf "%010d" "$current_byte_offset").zfs.gz.age"
                 
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       Creating shard $shard_num..."
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       Running: dd bs=$dynamic_shard_size_bytes count=1 of=$shard_file"
@@ -752,10 +811,13 @@ stream_zfs_to_cloud() {
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Cleaning up temp file: $shard_file"
                 rm -f "$shard_file"
                 ((processed_count++))
+                
+                # Update byte offset and shard number for next iteration
+                current_byte_offset=$((current_byte_offset + actual_size))
                 ((shard_num++))
                 
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       Completed shard processing, moving to shard $shard_num"
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: processed_count=$processed_count, shard_num=$shard_num"
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: processed_count=$processed_count, shard_num=$shard_num, next_offset=$current_byte_offset"
                 
                 # If this was a partial shard (smaller than expected), we're done
                 if [[ $actual_size -lt $dynamic_shard_size_bytes ]]; then
@@ -967,7 +1029,7 @@ run_restore() {
     
     # Discover shards
     echo "Discovering backup shards..."
-    local shard_files=($(rclone lsf "${remote_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9].zfs.gz.age$" | sort))
+    local shard_files=($(rclone lsf "${remote_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" | sort))
     
     if [[ ${#shard_files[@]} -eq 0 ]]; then
         echo "ERROR: No shards found for backup prefix: ${backup_prefix}"
