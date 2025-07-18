@@ -1349,6 +1349,54 @@ run_restore() {
     echo "Starting restore process..."
     echo "Working directory: $work_dir"
     
+    # Ensure target dataset mountpoint exists
+    echo "Preparing target dataset: $target_dataset"
+    
+    # Get the expected mountpoint for the target dataset
+    local mountpoint
+    if zfs list -H -o mountpoint "$target_dataset" 2>/dev/null; then
+        # Dataset exists, get its mountpoint
+        mountpoint=$(zfs list -H -o mountpoint "$target_dataset" 2>/dev/null)
+        echo "  Target dataset already exists with mountpoint: $mountpoint"
+    else
+        # Dataset doesn't exist, predict the mountpoint
+        # ZFS typically inherits from parent or uses /<pool>/<dataset>
+        local pool_name="${target_dataset%%/*}"
+        local dataset_path="${target_dataset#*/}"
+        
+        # Check if pool exists and get its mountpoint
+        if zfs list -H -o mountpoint "$pool_name" 2>/dev/null; then
+            local pool_mountpoint=$(zfs list -H -o mountpoint "$pool_name" 2>/dev/null)
+            if [[ "$pool_mountpoint" == "none" ]] || [[ "$pool_mountpoint" == "-" ]]; then
+                # Pool has no mountpoint, use standard ZFS path
+                mountpoint="/$target_dataset"
+            else
+                # Pool has mountpoint, build path from it
+                if [[ -n "$dataset_path" ]]; then
+                    mountpoint="$pool_mountpoint/$dataset_path"
+                else
+                    mountpoint="$pool_mountpoint"
+                fi
+            fi
+        else
+            echo "ERROR: ZFS pool '$pool_name' not found"
+            exit 1
+        fi
+        
+        echo "  Target dataset will be created with mountpoint: $mountpoint"
+    fi
+    
+    # Create mountpoint directory if it doesn't exist
+    if [[ "$mountpoint" != "none" ]] && [[ "$mountpoint" != "-" ]] && [[ ! -d "$mountpoint" ]]; then
+        echo "  Creating mountpoint directory: $mountpoint"
+        if sudo mkdir -p "$mountpoint"; then
+            echo "  ✓ Mountpoint created successfully"
+        else
+            echo "  ✗ Failed to create mountpoint directory"
+            exit 1
+        fi
+    fi
+    
     # Stream to ZFS receive with individual progress bars and pipeline buffer
     echo "Step 1: Streaming ${#shard_files[@]} shards to ZFS receive..."
     echo ""
