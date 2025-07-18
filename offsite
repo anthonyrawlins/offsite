@@ -1349,41 +1349,41 @@ run_restore() {
     echo "Starting restore process..."
     echo "Working directory: $work_dir"
     
-    # Stream directly to ZFS receive with true backpressure
-    echo "Step 1: Streaming ${#shard_files[@]} shards directly to ZFS receive..."
+    # Stream to ZFS receive with backpressure and minimal /tmp usage
+    echo "Step 1: Streaming ${#shard_files[@]} shards to ZFS receive..."
     echo ""
     
     # Create named pipe for streaming
     local fifo_path="$work_dir/zfs-stream.fifo"
     mkfifo "$fifo_path"
     
+    # Sort shards by byte offset to ensure correct order
+    local sorted_shards=()
+    for shard_file in "${shard_files[@]}"; do
+        local offset=$(echo "$shard_file" | sed 's/.*-s[0-9][0-9][0-9]-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
+        sorted_shards+=("$offset:$shard_file")
+    done
+    
+    # Sort by byte offset (numeric sort on the offset part)
+    IFS=$'\n' sorted_shards=($(sort -t: -k1,1n <<< "${sorted_shards[*]}"))
+    
     # Start ZFS receive in background, reading from the named pipe
     echo "  Starting ZFS receive process..."
     pv -p -t -e -r -B 1M -N "ZFS Receive" "$fifo_path" | zfs recv -F "$target_dataset" &
     local zfs_recv_pid=$!
     
-    # Stream shards directly to ZFS receive in byte offset order
-    echo "  Streaming shards in byte order with backpressure..."
+    # Stream all shards to the named pipe in correct order
+    echo "  Streaming ${#sorted_shards[@]} shards in byte order..."
     
-    # Stream shards to ZFS receive with minimal /tmp usage
+    # Stream shards to ZFS receive with backpressure
     {
-        # Sort shards by byte offset to ensure correct order
-        local sorted_shards=()
-        for shard_file in "${shard_files[@]}"; do
-            local offset=$(echo "$shard_file" | sed 's/.*-s[0-9][0-9][0-9]-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
-            sorted_shards+=("$offset:$shard_file")
-        done
-        
-        # Sort by byte offset (numeric sort on the offset part)
-        IFS=$'\n' sorted_shards=($(sort -t: -k1,1n <<< "${sorted_shards[*]}"))
-        
         # Process shards in byte offset order
         for entry in "${sorted_shards[@]}"; do
             local shard_file="${entry#*:}"
-            echo "    Processing: $shard_file"
+            echo "    Streaming: $shard_file"
             
             # Stream: download → decrypt → decompress → directly to ZFS receive
-            # This eliminates ALL temporary files!
+            # This approach uses minimal /tmp (only the named pipe)
             rclone cat "${remote_path}/${shard_file}" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip
         done
     } > "$fifo_path"
