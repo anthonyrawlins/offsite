@@ -672,11 +672,11 @@ stream_zfs_to_cloud() {
     trap - EXIT  # Remove trap first
     cleanup_temp_files
     
-    if [[ "$upload_success" == "true" ]] && [[ $split_exit_code -eq 0 ]]; then
+    if [[ "$upload_success" == "true" ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming backup complete: $processed_count shards uploaded"
         return 0
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✗ Backup failed (split exit: $split_exit_code, upload success: $upload_success)"
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✗ Backup failed (upload success: $upload_success)"
         return 1
     fi
 }
