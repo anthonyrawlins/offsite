@@ -594,65 +594,66 @@ stream_zfs_to_all_providers() {
     
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting streaming backup (full)"
     
-    # Get all existing shards from all providers to determine resume point
+    # Get all existing shards from all providers and build missing shard list
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Checking for existing shards across all providers..."
-    local all_existing_shards=()
+    local missing_shards=()
+    local max_shard_found=0
+    
+    # Create associative arrays to track which shards exist on which providers
+    declare -A provider_shards
     
     for prov in "${SELECTED_PROVIDERS[@]}"; do
         local rclone_remote="${PROVIDERS[$prov]}"
-        local provider_shards=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" | sort || true))
+        local provider_shard_list=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" | sort || true))
         
-        # Add provider prefix to track which provider has which shards
-        for shard in "${provider_shards[@]}"; do
-            all_existing_shards+=("${prov}:${shard}")
+        provider_shards[$prov]="${provider_shard_list[*]}"
+        
+        # Find max shard number to know the range to check
+        for shard in "${provider_shard_list[@]}"; do
+            local shard_num=$(echo "$shard" | sed -E 's/.*-s([0-9]{3})-b.*/\1/' | sed 's/^0*//')
+            if [[ $shard_num -gt $max_shard_found ]]; then
+                max_shard_found=$shard_num
+            fi
         done
     done
     
-    # Find the minimum resumable position across all providers
-    local min_complete_shard=0
-    local bytes_to_skip=0
-    
-    if [[ ${#all_existing_shards[@]} -gt 0 ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S')       Found existing shards across providers, calculating minimum resume position..."
+    if [[ $max_shard_found -gt 0 ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S')       Found shards up to shard $max_shard_found, checking for gaps..."
         
-        # Group shards by shard number and find minimum complete across all providers
-        for ((i=1; i<=200; i++)); do  # Check up to 200 shards
-            local shard_pattern="-s$(printf "%03d" "$i")-b"
-            local found_on_all_providers=true
+        # Check each shard from 1 to max_shard_found to find missing ones
+        for ((i=1; i<=max_shard_found; i++)); do
+            local shard_pattern="${backup_prefix}-s$(printf "%03d" "$i")-b"
+            local missing_on_any_provider=false
             
             for prov in "${SELECTED_PROVIDERS[@]}"; do
                 local found_on_provider=false
-                for existing in "${all_existing_shards[@]}"; do
-                    if [[ "$existing" == "${prov}:"*"${shard_pattern}"* ]]; then
-                        found_on_provider=true
-                        break
-                    fi
-                done
+                if [[ "${provider_shards[$prov]}" == *"$shard_pattern"* ]]; then
+                    found_on_provider=true
+                fi
+                
                 if [[ "$found_on_provider" == "false" ]]; then
-                    found_on_all_providers=false
+                    missing_on_any_provider=true
                     break
                 fi
             done
             
-            if [[ "$found_on_all_providers" == "true" ]]; then
-                min_complete_shard=$i
-            else
-                break
+            if [[ "$missing_on_any_provider" == "true" ]]; then
+                missing_shards+=($i)
             fi
         done
         
-        if [[ $min_complete_shard -gt 0 ]]; then
-            bytes_to_skip=$((min_complete_shard * 11380899))  # Assuming 11.4MB shards
-            echo "$(date '+%Y-%m-%d %H:%M:%S')       Resuming from shard $((min_complete_shard + 1)) (skipping $bytes_to_skip bytes)"
+        if [[ ${#missing_shards[@]} -gt 0 ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S')       Found ${#missing_shards[@]} missing shards: ${missing_shards[*]}"
         else
-            echo "$(date '+%Y-%m-%d %H:%M:%S')       No complete shards found across all providers - starting fresh"
+            echo "$(date '+%Y-%m-%d %H:%M:%S')       All existing shards complete across all providers"
         fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S')       No existing shards found - starting fresh backup"
+        missing_shards=(1)  # Start with shard 1
     fi
     
-    # Call the parallel streaming function
-    stream_zfs_to_cloud_parallel "$current_snap" "$backup_prefix" "$dataset_path" "$agekey" "$bytes_to_skip" "$((min_complete_shard + 1))"
+    # Call the parallel streaming function with missing shard list
+    stream_zfs_to_cloud_parallel "$current_snap" "$backup_prefix" "$dataset_path" "$agekey" "${missing_shards[*]}"
 }
 
 stream_zfs_to_cloud_parallel() {
@@ -660,13 +661,19 @@ stream_zfs_to_cloud_parallel() {
     local backup_prefix="$2"
     local dataset_path="$3"
     local agekey="$4"
-    local bytes_to_skip="$5"
-    local start_shard_num="$6"
+    local missing_shards_str="$5"
     
-    # Create ZFS send command
-    local zfs_cmd="zfs send \"$current_snap\""
+    # Convert missing shards string back to array
+    local missing_shards=($missing_shards_str)
     
-    # Get dataset size for progress estimation
+    if [[ ${#missing_shards[@]} -eq 0 ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     No missing shards - backup already complete!"
+        return 0
+    fi
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Processing ${#missing_shards[@]} missing shards: ${missing_shards[*]}"
+    
+    # Get dataset size for shard calculation
     local dataset_size_bytes=$(zfs get -H -o value -p used "${current_snap%@*}" 2>/dev/null || echo "1073741824")
     local dynamic_shard_size_bytes=$((dataset_size_bytes / 100))
     local min_shard_size=$((10 * 1024 * 1024))       # 10MB minimum
@@ -677,9 +684,6 @@ stream_zfs_to_cloud_parallel() {
     elif [[ $dynamic_shard_size_bytes -gt $max_shard_size ]]; then
         dynamic_shard_size_bytes=$max_shard_size
     fi
-    
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Streaming: $zfs_cmd"
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: $(numfmt --to=iec $dataset_size_bytes) (dynamic shards of $(numfmt --to=iec $dynamic_shard_size_bytes) each)"
     
     # Create temp directory for this backup session
     local temp_dir=$(mktemp -d)
@@ -693,29 +697,42 @@ stream_zfs_to_cloud_parallel() {
     
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting parallel streaming backup..."
     
-    # Create parallel streaming pipeline
+    # Convert missing shards to associative array for quick lookup
+    declare -A missing_shard_map
+    for shard in "${missing_shards[@]}"; do
+        missing_shard_map[$shard]=1
+    done
+    
+    # Find the minimum missing shard to start streaming from
+    local min_missing_shard=${missing_shards[0]}
+    for shard in "${missing_shards[@]}"; do
+        if [[ $shard -lt $min_missing_shard ]]; then
+            min_missing_shard=$shard
+        fi
+    done
+    
+    # Calculate bytes to skip to reach first missing shard
+    local bytes_to_skip=$(((min_missing_shard - 1) * dynamic_shard_size_bytes))
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting stream from shard $min_missing_shard (skipping $bytes_to_skip bytes)"
+    
+    # Create streaming pipeline that only processes missing shards
     {
-        eval "$zfs_cmd" | pv -s "$dataset_size_bytes" -p -t -e -r -B 1M -N "ZFS Stream" | {
+        zfs send "$current_snap" | pv -s "$dataset_size_bytes" -p -t -e -r -B 1M -N "ZFS Stream" | {
             local current_byte_offset=$bytes_to_skip
-            local shard_num=$start_shard_num
+            local shard_num=$min_missing_shard
             local processed_count=0
             
-            # Skip to resume position if needed
+            # Skip to first missing shard position
             if [[ $bytes_to_skip -gt 0 ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S')     Skipping $bytes_to_skip bytes to resume from shard $shard_num"
-                dd bs=65536 count=$((bytes_to_skip / 65536)) iflag=fullblock of=/dev/null 2>/dev/null
-                local skip_remaining=$((bytes_to_skip % 65536))
-                if [[ $skip_remaining -gt 0 ]]; then
-                    dd bs=1 count="$skip_remaining" iflag=fullblock of=/dev/null 2>/dev/null
-                fi
-                current_byte_offset=$bytes_to_skip
+                echo "$(date '+%Y-%m-%d %H:%M:%S')     Skipping $bytes_to_skip bytes to reach first missing shard"
+                # Use head to discard the bytes we want to skip
+                head -c "$bytes_to_skip" > /dev/null
             fi
             
             while true; do
                 local shard_file="$temp_dir/shard-$(printf "%03d" "$shard_num")"
                 local output_file="${backup_prefix}-s$(printf "%03d" "$shard_num")-b$(printf "%010d" "$current_byte_offset").zfs.gz.age"
-                
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       Creating shard $shard_num..."
                 
                 # Read exactly one shard worth of data
                 local head_result
@@ -734,10 +751,17 @@ stream_zfs_to_cloud_parallel() {
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       Final partial shard $shard_num created ($actual_size bytes)"
                 fi
                 
-                # Upload this shard to all providers in parallel
-                upload_shard_to_all_providers "$shard_file" "$output_file" "$dataset_path" "$agekey" "$shard_num" &
+                # Only upload if this shard is actually missing
+                if [[ -n "${missing_shard_map[$shard_num]}" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Creating missing shard $shard_num..."
+                    # Upload this shard to all providers in parallel
+                    upload_shard_to_all_providers "$shard_file" "$output_file" "$dataset_path" "$agekey" "$shard_num" &
+                else
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Shard $shard_num exists on all providers - skipping"
+                    rm -f "$shard_file"
+                fi
                 
-                # Clean up temp file and update for next iteration
+                # Update for next iteration
                 current_byte_offset=$((current_byte_offset + actual_size))
                 shard_num=$((shard_num + 1))
                 processed_count=$((processed_count + 1))
@@ -750,7 +774,6 @@ stream_zfs_to_cloud_parallel() {
                 fi
             done
             
-            # Wait for all parallel uploads to complete
             echo "$(date '+%Y-%m-%d %H:%M:%S')     Waiting for all parallel uploads to complete..."
             wait
             echo "$(date '+%Y-%m-%d %H:%M:%S')     All parallel uploads completed"
