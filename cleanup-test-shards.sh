@@ -35,21 +35,15 @@ echo "Backup prefix: $BACKUP_PREFIX"
 echo "Dataset path: $DATASET_PATH"
 echo ""
 
-# Configure rclone for Backblaze B2 (temporary config)
-export RCLONE_CONFIG_CLEANUP_B2_TYPE="b2"
-export RCLONE_CONFIG_CLEANUP_B2_ACCOUNT="$B2_KEY_ID"
-export RCLONE_CONFIG_CLEANUP_B2_KEY="$B2_APPLICATION_KEY"
+# Use existing rclone configs instead of creating temporary ones
+# Extract bucket info from existing config
+B2_REMOTE_PATH="cloudremote:${B2_BUCKET_NAME}/zfs-backups"
 
-# Configure rclone for Scaleway (if available)
-if [[ -n "${SCW_ACCESS_KEY:-}" ]] && [[ -n "${SCW_SECRET_KEY:-}" ]] && [[ -n "${SCALEWAY_REMOTE:-}" ]]; then
-    export RCLONE_CONFIG_CLEANUP_SCW_TYPE="s3"
-    export RCLONE_CONFIG_CLEANUP_SCW_PROVIDER="Scaleway"
-    export RCLONE_CONFIG_CLEANUP_SCW_ACCESS_KEY_ID="$SCW_ACCESS_KEY"
-    export RCLONE_CONFIG_CLEANUP_SCW_SECRET_ACCESS_KEY="$SCW_SECRET_KEY"
-    export RCLONE_CONFIG_CLEANUP_SCW_ENDPOINT="s3.fr-par.scw.cloud"
-    
-    # Extract bucket name from SCALEWAY_REMOTE (format: scaleway:bucket/path)
+# Configure Scaleway (if available)
+if [[ -n "${SCALEWAY_REMOTE:-}" ]]; then
+    # SCALEWAY_REMOTE format: "scaleway:bucket/path"
     SCW_BUCKET_NAME=$(echo "$SCALEWAY_REMOTE" | sed 's/scaleway:\([^/]*\).*/\1/')
+    SCW_REMOTE_PATH="scaleway:${SCW_BUCKET_NAME}/zfs-backups"
     
     SCALEWAY_AVAILABLE=true
     echo "  ✓ Scaleway: $SCW_BUCKET_NAME"
@@ -67,18 +61,19 @@ echo ""
 cleanup_provider() {
     local provider_name="$1"
     local rclone_remote="$2"
-    local bucket="$3"
+    local bucket_path="$3"
     
     echo "[Cleaning $provider_name]"
     
     # List existing files with both old and new naming patterns
     echo "  Listing existing files..."
+    echo "  DEBUG: Checking path: ${rclone_remote}:${bucket_path}/${DATASET_PATH}/"
     
     # Old pattern: prefix-s###.zfs.gz.age
-    local old_files=$(rclone lsf "${rclone_remote}:${bucket}/${DATASET_PATH}/" 2>/dev/null | grep "^${BACKUP_PREFIX}-s[0-9][0-9][0-9].zfs.gz.age$" || true)
+    local old_files=$(rclone lsf "${rclone_remote}:${bucket_path}/${DATASET_PATH}/" 2>/dev/null | grep "^${BACKUP_PREFIX}-s[0-9][0-9][0-9].zfs.gz.age$" || true)
     
     # New pattern: prefix-s###-b##########.zfs.gz.age  
-    local new_files=$(rclone lsf "${rclone_remote}:${bucket}/${DATASET_PATH}/" 2>/dev/null | grep "^${BACKUP_PREFIX}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" || true)
+    local new_files=$(rclone lsf "${rclone_remote}:${bucket_path}/${DATASET_PATH}/" 2>/dev/null | grep "^${BACKUP_PREFIX}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" || true)
     
     local all_files="$old_files"$'\n'"$new_files"
     all_files=$(echo "$all_files" | grep -v "^$" || true)
@@ -94,7 +89,7 @@ cleanup_provider() {
     # List files with sizes
     while IFS= read -r file; do
         [[ -z "$file" ]] && continue
-        local size=$(rclone size "${rclone_remote}:${bucket}/${DATASET_PATH}/${file}" 2>/dev/null | awk '{print $4}' || echo "unknown")
+        local size=$(rclone size "${rclone_remote}:${bucket_path}/${DATASET_PATH}/${file}" 2>/dev/null | awk '{print $4}' || echo "unknown")
         echo "    - $file ($size)"
     done <<< "$all_files"
     
@@ -105,7 +100,7 @@ cleanup_provider() {
         while IFS= read -r file; do
             [[ -z "$file" ]] && continue
             echo "    Deleting: $file"
-            if rclone delete "${rclone_remote}:${bucket}/${DATASET_PATH}/${file}" 2>/dev/null; then
+            if rclone delete "${rclone_remote}:${bucket_path}/${DATASET_PATH}/${file}" 2>/dev/null; then
                 echo "      ✓ Deleted"
             else
                 echo "      ✗ Failed to delete"
@@ -119,11 +114,11 @@ cleanup_provider() {
 }
 
 # Clean Backblaze B2
-cleanup_provider "Backblaze B2" "cleanup-b2" "$B2_BUCKET_NAME"
+cleanup_provider "Backblaze B2" "cloudremote" "${B2_BUCKET_NAME}/zfs-backups"
 
 # Clean Scaleway (if available)
 if [[ "$SCALEWAY_AVAILABLE" == "true" ]]; then
-    cleanup_provider "Scaleway" "cleanup-scw" "$SCW_BUCKET_NAME"
+    cleanup_provider "Scaleway" "scaleway" "${SCW_BUCKET_NAME}/zfs-backups"
 fi
 
 echo "=== Cleanup Complete ==="
