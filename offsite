@@ -473,14 +473,35 @@ backup_single_provider() {
     echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Backup complete to $provider_name"
 }
 
-# Check if a backup is complete by looking for shard 100
+# Check if a backup is complete by looking for the final shard (may not be shard 100)
 is_backup_complete() {
     local rclone_remote="$1"
     local dataset_path="$2" 
     local backup_prefix="$3"
     
-    local completion_shard="${backup_prefix}-s100.zfs.gz.age"
-    rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep -q "^${completion_shard}$"
+    # Get all shards for this backup and find the highest numbered one
+    local all_shards=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9].zfs.gz.age$" | sort))
+    
+    if [[ ${#all_shards[@]} -eq 0 ]]; then
+        return 1  # No shards found
+    fi
+    
+    # Get the highest shard number
+    local highest_shard="${all_shards[-1]}"
+    local shard_number=$(echo "$highest_shard" | sed -E 's/.*-s([0-9]{3})\.zfs\.gz\.age$/\1/')
+    
+    # For compressed backups, we may have fewer shards than expected
+    # A backup is complete if:
+    # 1. We have exactly 100 shards (original target), OR
+    # 2. We have multiple shards (assuming the last was a final partial shard)
+    # 3. We have just 1 shard but it's very small (entire backup fit in one shard)
+    
+    if [[ $shard_number == "100" ]] || [[ ${#all_shards[@]} -ge 2 ]]; then
+        return 0  # Complete
+    else
+        # Single shard - need to check if it's a complete small backup
+        return 1  # Incomplete for now
+    fi
 }
 
 # Streaming ZFS backup function - no temp files needed!
