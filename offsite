@@ -599,6 +599,11 @@ stream_zfs_to_cloud() {
         
         if [[ -f "$expected_shard" ]]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S')     Found shard file: $expected_shard"
+            
+            # Show what files exist before processing
+            local temp_files_before=($(ls "$temp_dir"/shard-* 2>/dev/null || echo "none"))
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     Temp files before processing: ${temp_files_before[*]}"
+            
             # Wait a moment to ensure the shard is complete (split might still be writing to it)
             local initial_size=$(stat -c%s "$expected_shard" 2>/dev/null || echo "0")
             sleep 0.1
@@ -634,8 +639,14 @@ stream_zfs_to_cloud() {
                 fi
             fi
             
-            # Don't delete temp file yet - let split finish all shards first
+            # Don't delete temp file yet - let split finish all shards first  
             # rm -f "$expected_shard"  # Commented out - clean up after split completes
+            
+            # Show what files exist after processing
+            local temp_files_after=($(ls "$temp_dir"/shard-* 2>/dev/null || echo "none"))
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     Temp files after processing: ${temp_files_after[*]}"
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     Moving to shard $((shard_num + 1))"
+            
             ((processed_count++))
             ((shard_num++))
         else
