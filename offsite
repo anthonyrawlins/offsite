@@ -668,9 +668,9 @@ stream_zfs_to_cloud() {
         shard_num=$((${#existing_shards[@]} + 1))
     fi
     
-    # Create a custom streaming pipeline with controlled backpressure
+    # Create a custom streaming pipeline with controlled backpressure and progress tracking
     {
-        eval "$zfs_cmd" | {
+        eval "$zfs_cmd" | pv -s "$dataset_size_bytes" -p -t -e -r -B 1M -N "ZFS Stream" | {
             # Calculate byte offset for resume (moved inside subshell to fix variable scoping)
             local bytes_to_skip=0
             local shard_num=1
@@ -790,9 +790,10 @@ stream_zfs_to_cloud() {
                     local shard_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
                     echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading $(numfmt --to=iec $shard_size)..."
                     
-                    # Stream shard: compress -> encrypt -> upload
+                    # Stream shard: compress -> encrypt -> progress -> upload
                     echo "$(date '+%Y-%m-%d %H:%M:%S')         DEBUG: Starting rclone upload pipeline"
-                    if gzip < "$shard_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
+                    # Note: pv size estimate may be off due to compression, but shows upload progress
+                    if gzip < "$shard_file" | age -r "$agekey" | pv -p -t -e -r -B 1M -N "Shard $shard_num" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
                         echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
                         echo "$(date '+%Y-%m-%d %H:%M:%S')         DEBUG: Upload successful"
                     else
@@ -1115,7 +1116,9 @@ run_restore() {
     echo "Step 1: Downloading shards..."
     for shard_file in "${shard_files[@]}"; do
         echo "  Downloading: $shard_file"
-        rclone copy "${remote_path}/${shard_file}" ./
+        # Get remote file size for progress bar
+        local shard_size=$(rclone size "${remote_path}/${shard_file}" 2>/dev/null | awk '{print $4}' || echo "0")
+        rclone cat "${remote_path}/${shard_file}" | pv -s "$shard_size" -p -t -e -r -B 1M -N "Download: $(basename $shard_file)" > "$shard_file"
     done
     
     # Decrypt and decompress shards
@@ -1124,18 +1127,20 @@ run_restore() {
         echo "  Processing: $shard_file"
         # Extract the shard number from filename
         local shard_num=$(echo "$shard_file" | sed 's/.*-s\([0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
-        age -d -i "$AGE_PRIVATE_KEY_FILE" "$shard_file" | gunzip > "shard-${shard_num}.restored"
+        local encrypted_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
+        pv -s "$encrypted_size" -p -t -e -r -B 1M -N "Decrypt shard $shard_num" "$shard_file" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip > "shard-${shard_num}.restored"
         echo "    ✓ Restored: shard-${shard_num}.restored"
     done
     
     # Reconstitute stream
     echo "Step 3: Reconstituting ZFS stream..."
     cat shard-*.restored > complete-stream.zfs
-    echo "Complete stream size: $(wc -c < complete-stream.zfs) bytes"
+    local stream_size=$(stat -c%s complete-stream.zfs)
+    echo "Complete stream size: $(numfmt --to=iec $stream_size)"
     
     # ZFS receive
     echo "Step 4: Performing ZFS receive..."
-    zfs recv -F "$target_dataset" < complete-stream.zfs
+    pv -s "$stream_size" -p -t -e -r -B 1M -N "ZFS Receive" complete-stream.zfs | zfs recv -F "$target_dataset"
     
     # Cleanup
     cd /
