@@ -584,7 +584,7 @@ stream_zfs_to_cloud() {
     if [[ ${#existing_shards[@]} -gt 0 ]]; then
         # Check if backup is already complete by looking for shard 100
         if is_backup_complete "$rclone_remote" "$dataset_path" "$backup_prefix"; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Backup already complete: found shard 100 of 100"
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Backup already complete: detected completion pattern"
             echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ All ${#existing_shards[@]} shards exist in cloud storage"
             echo "$(date '+%Y-%m-%d %H:%M:%S')     Skipping backup - already complete"
             return 0
@@ -687,41 +687,61 @@ stream_zfs_to_cloud() {
                 
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       Creating shard $shard_num..."
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       Running: dd bs=$dynamic_shard_size_bytes count=1 of=$shard_file"
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Pipeline status before dd: ${PIPESTATUS[*]}"
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Current shell process: $$"
                 
                 # Read exactly one shard worth of data (with backpressure)
                 local dd_result
                 dd_result=$(dd bs="$dynamic_shard_size_bytes" count=1 of="$shard_file" 2>&1)
                 local dd_exit_code=$?
                 
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: dd raw output: $dd_result"
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Pipeline status after dd: ${PIPESTATUS[*]}"
+                
                 # Get actual size of created file
                 local actual_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       dd result: exit_code=$dd_exit_code, file_size=$actual_size bytes"
                 
+                # Check if shard file was actually created
+                if [[ ! -f "$shard_file" ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       ERROR: Shard file was not created: $shard_file"
+                    break
+                fi
+                
                 if [[ $dd_exit_code -ne 0 ]] || [[ $actual_size -eq 0 ]]; then
                     # End of stream or error
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       End of stream detected (exit_code=$dd_exit_code, size=$actual_size)"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Breaking from while loop at shard $shard_num"
                     rm -f "$shard_file"
                     break
                 elif [[ $actual_size -lt $dynamic_shard_size_bytes ]]; then
                     # Partial shard exists, process it as final shard
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       Final partial shard $shard_num created ($actual_size bytes)"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: This should be the last shard"
                 fi
                 
                 # Check if this shard already exists in cloud (resumable backup)
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Checking if shard already exists: $output_file"
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Existing shards array has ${#existing_shards[@]} items"
                 if printf '%s\n' "${existing_shards[@]}" | grep -q "^${output_file}$"; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       ✓ Shard $shard_num already exists: $output_file"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Skipping upload for existing shard"
                 else
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing shard $shard_num..."
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Starting upload process for new shard"
                     
                     # Get shard file size
                     local shard_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
                     echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading $(numfmt --to=iec $shard_size)..."
                     
                     # Stream shard: compress -> encrypt -> upload
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')         DEBUG: Starting rclone upload pipeline"
                     if gzip < "$shard_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
                         echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
+                        echo "$(date '+%Y-%m-%d %H:%M:%S')         DEBUG: Upload successful"
                     else
                         echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
+                        echo "$(date '+%Y-%m-%d %H:%M:%S')         DEBUG: Upload failed, breaking from loop"
                         upload_success=false
                         rm -f "$shard_file"
                         break
@@ -729,17 +749,25 @@ stream_zfs_to_cloud() {
                 fi
                 
                 # Clean up temp file immediately after processing (true streaming!)
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Cleaning up temp file: $shard_file"
                 rm -f "$shard_file"
                 ((processed_count++))
                 ((shard_num++))
                 
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       Completed shard processing, moving to shard $shard_num"
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: processed_count=$processed_count, shard_num=$shard_num"
                 
                 # If this was a partial shard (smaller than expected), we're done
                 if [[ $actual_size -lt $dynamic_shard_size_bytes ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       Final shard processed, backup complete"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Breaking from loop due to partial shard"
                     break
                 fi
+                
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Continuing to next iteration of while loop"
+            done
+            
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     DEBUG: Exited while loop, processed_count=$processed_count"
                 
                 # Exit if we've reached estimated shard count  
                 if [[ $shard_num -gt $estimated_shards ]]; then
