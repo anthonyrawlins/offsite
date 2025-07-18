@@ -1349,21 +1349,68 @@ run_restore() {
     echo "Starting restore process..."
     echo "Working directory: $work_dir"
     
-    # Download all shards
-    echo "Step 1: Downloading shards..."
-    for shard_file in "${shard_files[@]}"; do
-        echo "  Downloading: $shard_file"
-        # Get remote file size for progress bar
-        local shard_size=$(rclone size "${remote_path}/${shard_file}" 2>/dev/null | grep "Total size:" | sed 's/.*(\([0-9]*\) Bytes).*/\1/' || echo "0")
+    # Download all shards in parallel with multiple progress bars
+    echo "Step 1: Downloading ${#shard_files[@]} shards in parallel..."
+    echo ""
+    
+    local max_parallel=4  # Maximum concurrent downloads (conservative for bandwidth)
+    local download_pids=()
+    local total_shards=${#shard_files[@]}
+    local completed_downloads=0
+    
+    # Start parallel downloads with batching
+    for i in "${!shard_files[@]}"; do
+        local shard_file="${shard_files[$i]}"
+        local shard_num=$((i + 1))
         
-        # Fallback to progress without size if extraction failed
-        if [[ "$shard_size" =~ ^[0-9]+$ ]] && [[ "$shard_size" -gt 0 ]]; then
-            rclone cat "${remote_path}/${shard_file}" | pv -s "$shard_size" -p -t -e -r -B 1M -N "Download: $(basename $shard_file)" > "$shard_file"
-        else
-            echo "    Warning: Could not determine file size, downloading without progress bar"
-            rclone cat "${remote_path}/${shard_file}" | pv -p -t -e -r -B 1M -N "Download: $(basename $shard_file)" > "$shard_file"
-        fi
+        # Wait if we've reached max parallel downloads
+        while [[ ${#download_pids[@]} -ge $max_parallel ]]; do
+            # Check for completed downloads and clean up PID array
+            local new_pids=()
+            for pid in "${download_pids[@]}"; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    new_pids+=("$pid")
+                else
+                    wait "$pid"  # Clean up zombie process
+                    ((completed_downloads++))
+                fi
+            done
+            download_pids=("${new_pids[@]}")
+            
+            # Brief sleep to avoid busy waiting
+            sleep 0.2
+        done
+        
+        # Start background download
+        {
+            # Get remote file size for progress bar
+            local shard_size=$(rclone size "${remote_path}/${shard_file}" 2>/dev/null | grep "Total size:" | sed 's/.*(\([0-9]*\) Bytes).*/\1/' 2>/dev/null || echo "0")
+            
+            # Create short name for progress display  
+            local short_name="Shard $(printf "%03d" "$shard_num")"
+            
+            # Download with progress bar
+            if [[ "$shard_size" =~ ^[0-9]+$ ]] && [[ "$shard_size" -gt 0 ]]; then
+                rclone cat "${remote_path}/${shard_file}" | pv -s "$shard_size" -p -t -e -r -B 512K -N "$short_name" > "$shard_file"
+            else
+                rclone cat "${remote_path}/${shard_file}" | pv -p -t -e -r -B 512K -N "$short_name" > "$shard_file"
+            fi
+        } &
+        
+        download_pids+=($!)
     done
+    
+    # Wait for all remaining downloads to complete
+    echo ""
+    echo "Finishing remaining downloads..."
+    for pid in "${download_pids[@]}"; do
+        wait "$pid"
+        ((completed_downloads++))
+    done
+    
+    echo ""
+    echo "✓ Downloaded all $total_shards shards"
+    echo ""
     
     # Decrypt and decompress shards
     echo "Step 2: Decrypting and decompressing shards..."
