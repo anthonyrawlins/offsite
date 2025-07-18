@@ -822,10 +822,12 @@ stream_zfs_to_cloud() {
                 
                 # Clean up temp file immediately after processing (true streaming!)
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Cleaning up temp file: $shard_file"
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: actual_size before cleanup: $actual_size"
                 rm -f "$shard_file"
                 ((processed_count++))
                 
                 # Update byte offset and shard number for next iteration
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: actual_size after cleanup: $actual_size"
                 current_byte_offset=$((current_byte_offset + actual_size))
                 ((shard_num++))
                 
