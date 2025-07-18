@@ -1349,13 +1349,9 @@ run_restore() {
     echo "Starting restore process..."
     echo "Working directory: $work_dir"
     
-    # Stream to ZFS receive with backpressure and minimal /tmp usage
+    # Stream to ZFS receive with minimal /tmp usage
     echo "Step 1: Streaming ${#shard_files[@]} shards to ZFS receive..."
     echo ""
-    
-    # Create named pipe for streaming
-    local fifo_path="$work_dir/zfs-stream.fifo"
-    mkfifo "$fifo_path"
     
     # Sort shards by byte offset to ensure correct order
     local sorted_shards=()
@@ -1367,34 +1363,21 @@ run_restore() {
     # Sort by byte offset (numeric sort on the offset part)
     IFS=$'\n' sorted_shards=($(sort -t: -k1,1n <<< "${sorted_shards[*]}"))
     
-    # Start ZFS receive in background, reading from the named pipe
-    echo "  Starting ZFS receive process..."
-    pv -p -t -e -r -B 1M -N "ZFS Receive" "$fifo_path" | zfs recv -F "$target_dataset" &
-    local zfs_recv_pid=$!
+    echo "  Streaming ${#sorted_shards[@]} shards directly to ZFS receive..."
     
-    # Stream all shards to the named pipe in correct order
-    echo "  Streaming ${#sorted_shards[@]} shards in byte order..."
-    
-    # Stream shards to ZFS receive with backpressure
+    # Stream: download → decrypt → decompress → ZFS receive (all in one pipeline)
+    # This uses absolutely minimal /tmp space - just the pipeline buffers
     {
-        # Process shards in byte offset order
         for entry in "${sorted_shards[@]}"; do
             local shard_file="${entry#*:}"
-            echo "    Streaming: $shard_file"
+            echo "    Processing: $shard_file" >&2
             
-            # Stream: download → decrypt → decompress → directly to ZFS receive
-            # This approach uses minimal /tmp (only the named pipe)
+            # Stream: download → decrypt → decompress
             rclone cat "${remote_path}/${shard_file}" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip
         done
-    } > "$fifo_path"
+    } | pv -p -t -e -r -B 1M -N "ZFS Receive" | zfs recv -F "$target_dataset"
     
-    # Wait for ZFS receive to complete
-    echo "  Waiting for ZFS receive to finish..."
-    wait $zfs_recv_pid
     local zfs_recv_result=$?
-    
-    # Clean up named pipe
-    rm -f "$fifo_path"
     
     if [[ $zfs_recv_result -eq 0 ]]; then
         echo "  ✓ ZFS receive completed successfully"
