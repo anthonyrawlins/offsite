@@ -490,25 +490,43 @@ stream_zfs_to_cloud() {
     # Get dataset size for progress estimation (always full backup)
     dataset_size_bytes=$(zfs get -H -o value -p used "${current_snap%@*}" 2>/dev/null || echo "1073741824")
     
-    # Calculate estimated shards based on SHARD_SIZE
-    # Convert SHARD_SIZE to bytes (support K, M, G suffixes)
-    local shard_size_bytes
-    case "$SHARD_SIZE" in
-        *K) shard_size_bytes=$((${SHARD_SIZE%K} * 1024)) ;;
-        *M) shard_size_bytes=$((${SHARD_SIZE%M} * 1024 * 1024)) ;;
-        *G) shard_size_bytes=$((${SHARD_SIZE%G} * 1024 * 1024 * 1024)) ;;
-        *) shard_size_bytes="$SHARD_SIZE" ;;  # Assume bytes if no suffix
-    esac
-    estimated_shards=$(((dataset_size_bytes + shard_size_bytes - 1) / shard_size_bytes))  # Round up
+    # Calculate dynamic shard size: 1% of dataset = exactly 100 shards
+    # This provides perfect progress tracking regardless of dataset size
+    local dynamic_shard_size_bytes=$((dataset_size_bytes / 100))
+    
+    # Set minimum shard size (10MB) and maximum shard size (50GB) for practical limits
+    local min_shard_size=$((10 * 1024 * 1024))      # 10MB minimum
+    local max_shard_size=$((50 * 1024 * 1024 * 1024)) # 50GB maximum
+    
+    if [[ $dynamic_shard_size_bytes -lt $min_shard_size ]]; then
+        dynamic_shard_size_bytes=$min_shard_size
+        estimated_shards=$(((dataset_size_bytes + dynamic_shard_size_bytes - 1) / dynamic_shard_size_bytes))
+    elif [[ $dynamic_shard_size_bytes -gt $max_shard_size ]]; then
+        dynamic_shard_size_bytes=$max_shard_size
+        estimated_shards=$(((dataset_size_bytes + dynamic_shard_size_bytes - 1) / dynamic_shard_size_bytes))
+    else
+        estimated_shards=100  # Exactly 100 shards at 1% each
+    fi
+    
     estimated_shards=$((estimated_shards > 0 ? estimated_shards : 1))  # Minimum 1 shard
+    
+    # Convert to human-readable shard size
+    local shard_size_human
+    if [[ $dynamic_shard_size_bytes -ge $((1024 * 1024 * 1024)) ]]; then
+        shard_size_human="$((dynamic_shard_size_bytes / 1024 / 1024 / 1024))G"
+    elif [[ $dynamic_shard_size_bytes -ge $((1024 * 1024)) ]]; then
+        shard_size_human="$((dynamic_shard_size_bytes / 1024 / 1024))M"
+    else
+        shard_size_human="$((dynamic_shard_size_bytes / 1024))K"
+    fi
     
     # Show size estimation
     local size_mb=$((dataset_size_bytes / 1024 / 1024))
     if [[ $size_mb -gt 1024 ]]; then
         local size_gb=$((size_mb / 1024))
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: ${size_gb}GB (~${estimated_shards} shards)"
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: ${size_gb}GB (${estimated_shards} shards of ${shard_size_human} each)"
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: ${size_mb}MB (~${estimated_shards} shards)"
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: ${size_mb}MB (${estimated_shards} shards of ${shard_size_human} each)"
     fi
     
     # Stream with minimal temp space - use named pipes for zero-copy streaming
@@ -534,7 +552,7 @@ stream_zfs_to_cloud() {
     
     # Background process to handle sharding
     {
-        eval "$zfs_cmd" | split -b "$SHARD_SIZE" --numeric-suffixes=1 --suffix-length=3 - "$pipe_dir/shard-"
+        eval "$zfs_cmd" | split -b "$dynamic_shard_size_bytes" --numeric-suffixes=1 --suffix-length=3 - "$pipe_dir/shard-"
         echo "SPLIT_DONE" > "$shard_pipe"
     } &
     local split_pid=$!

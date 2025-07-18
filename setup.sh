@@ -104,10 +104,11 @@ AGE_PRIVATE_KEY_FILE="$HOME/.config/age/zfs-backup.txt"
 TEMP_DIR="/tmp"
 
 # === Shard Configuration ===
-# Size of each shard for streaming backup (supports K, M, G suffixes)
-# Default: 1G (1 Gigabyte) - adjust based on your needs
-# Examples: 512M (for slower connections), 2G (for faster connections)
-SHARD_SIZE="1G"
+# NOTE: Shard size is now automatically calculated as 1% of dataset size
+# This provides exactly 100 shards for perfect progress tracking
+# Example: 100GB dataset = 1GB shards, 1TB dataset = 10GB shards
+# Manual override available if needed (supports K, M, G suffixes)
+# SHARD_SIZE="1G"  # Uncomment to override automatic sizing
 EOF
     
     chmod 600 ~/.config/offsite/config.env
