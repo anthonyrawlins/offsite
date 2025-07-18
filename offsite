@@ -831,11 +831,16 @@ stream_zfs_to_cloud() {
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       Completed shard processing, moving to shard $shard_num"
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: processed_count=$processed_count, shard_num=$shard_num, next_offset=$current_byte_offset"
                 
-                # If this was a partial shard (smaller than expected), we're done
-                if [[ $actual_size -lt $dynamic_shard_size_bytes ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Final shard processed, backup complete"
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Breaking from loop due to partial shard"
+                # Only break if this is a significantly small shard (< 10% of expected)
+                # A shard that's 80-90% of expected size is still valid data
+                local min_shard_threshold=$((dynamic_shard_size_bytes / 10))  # 10% of expected
+                if [[ $actual_size -lt $min_shard_threshold ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Tiny shard detected ($actual_size bytes < $min_shard_threshold threshold)"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Breaking from loop due to very small shard"
                     break
+                elif [[ $actual_size -lt $dynamic_shard_size_bytes ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Partial shard but continuing ($actual_size of $dynamic_shard_size_bytes expected)"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Shard is smaller but not tiny, continuing backup"
                 fi
                 
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Continuing to next iteration of while loop"
