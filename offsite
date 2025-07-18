@@ -613,9 +613,9 @@ stream_zfs_to_cloud() {
     # This provides perfect progress tracking regardless of dataset size
     local dynamic_shard_size_bytes=$((dataset_size_bytes / 100))
     
-    # Set minimum shard size (10MB) and maximum shard size (50GB) for practical limits
-    local min_shard_size=$((10 * 1024 * 1024))      # 10MB minimum
-    local max_shard_size=$((50 * 1024 * 1024 * 1024)) # 50GB maximum
+    # Set minimum shard size (10MB) and maximum shard size (5GB) for cloud provider limits
+    local min_shard_size=$((10 * 1024 * 1024))       # 10MB minimum
+    local max_shard_size=$((5 * 1024 * 1024 * 1024))  # 5GB maximum (Amazon S3 object limit)
     
     if [[ $dynamic_shard_size_bytes -lt $min_shard_size ]]; then
         dynamic_shard_size_bytes=$min_shard_size
