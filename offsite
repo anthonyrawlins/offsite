@@ -1349,119 +1349,59 @@ run_restore() {
     echo "Starting restore process..."
     echo "Working directory: $work_dir"
     
-    # Process shards in waves to minimize /tmp space usage
-    echo "Step 1: Processing ${#shard_files[@]} shards in waves..."
+    # Stream directly to ZFS receive with true backpressure
+    echo "Step 1: Streaming ${#shard_files[@]} shards directly to ZFS receive..."
     echo ""
     
-    local wave_size=6  # Process 6 shards at a time
-    local total_shards=${#shard_files[@]}
-    local processed_shards=0
-    local restored_shards=()
+    # Create named pipe for streaming
+    local fifo_path="$work_dir/zfs-stream.fifo"
+    mkfifo "$fifo_path"
     
-    # Process shards in waves
-    for ((wave_start=0; wave_start<total_shards; wave_start+=wave_size)); do
-        local wave_end=$((wave_start + wave_size))
-        if [[ $wave_end -gt $total_shards ]]; then
-            wave_end=$total_shards
-        fi
-        
-        local current_wave_size=$((wave_end - wave_start))
-        echo "Processing wave $((wave_start/wave_size + 1)) (shards $((wave_start + 1))-$wave_end)..."
-        
-        # Download shards in this wave in parallel
-        local download_pids=()
-        for ((i=wave_start; i<wave_end; i++)); do
-            local shard_file="${shard_files[$i]}"
-            local shard_num=$((i + 1))
-            
-            # Start background download
-            {
-                # Get remote file size for progress bar
-                local shard_size=$(rclone size "${remote_path}/${shard_file}" 2>/dev/null | grep "Total size:" | sed 's/.*(\([0-9]*\) Bytes).*/\1/' 2>/dev/null || echo "0")
-                
-                # Create short name for progress display  
-                local short_name="Shard $(printf "%03d" "$shard_num")"
-                
-                # Download with progress bar
-                if [[ "$shard_size" =~ ^[0-9]+$ ]] && [[ "$shard_size" -gt 0 ]]; then
-                    rclone cat "${remote_path}/${shard_file}" | pv -s "$shard_size" -p -t -e -r -B 512K -N "$short_name" > "$shard_file"
-                else
-                    rclone cat "${remote_path}/${shard_file}" | pv -p -t -e -r -B 512K -N "$short_name" > "$shard_file"
-                fi
-            } &
-            
-            download_pids+=($!)
+    # Start ZFS receive in background, reading from the named pipe
+    echo "  Starting ZFS receive process..."
+    pv -p -t -e -r -B 1M -N "ZFS Receive" "$fifo_path" | zfs recv -F "$target_dataset" &
+    local zfs_recv_pid=$!
+    
+    # Stream shards directly to ZFS receive in byte offset order
+    echo "  Streaming shards in byte order with backpressure..."
+    
+    # Stream shards to ZFS receive with minimal /tmp usage
+    {
+        # Sort shards by byte offset to ensure correct order
+        local sorted_shards=()
+        for shard_file in "${shard_files[@]}"; do
+            local offset=$(echo "$shard_file" | sed 's/.*-s[0-9][0-9][0-9]-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
+            sorted_shards+=("$offset:$shard_file")
         done
         
-        # Wait for all downloads in this wave to complete
-        echo ""
-        echo "  Waiting for wave downloads to complete..."
-        for pid in "${download_pids[@]}"; do
-            wait "$pid"
+        # Sort by byte offset (numeric sort on the offset part)
+        IFS=$'\n' sorted_shards=($(sort -t: -k1,1n <<< "${sorted_shards[*]}"))
+        
+        # Process shards in byte offset order
+        for entry in "${sorted_shards[@]}"; do
+            local shard_file="${entry#*:}"
+            echo "    Processing: $shard_file"
+            
+            # Stream: download → decrypt → decompress → directly to ZFS receive
+            # This eliminates ALL temporary files!
+            rclone cat "${remote_path}/${shard_file}" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip
         done
-        
-        # Process (decrypt/decompress) this wave immediately
-        echo "  Processing downloaded shards..."
-        for ((i=wave_start; i<wave_end; i++)); do
-            local shard_file="${shard_files[$i]}"
-            local shard_num=$((i + 1))
-            
-            # Extract the shard number and byte offset from new filename format
-            local shard_num_padded=$(echo "$shard_file" | sed 's/.*-s\([0-9][0-9][0-9]\)-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$/\1/')
-            local byte_offset=$(echo "$shard_file" | sed 's/.*-s[0-9][0-9][0-9]-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
-            local encrypted_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
-            
-            # Decrypt and decompress
-            local restored_file="shard-${shard_num_padded}-b${byte_offset}.restored"
-            pv -s "$encrypted_size" -p -t -e -r -B 1M -N "Decrypt $(printf "%03d" "$shard_num")" "$shard_file" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip > "$restored_file"
-            
-            # Clean up encrypted file immediately to save space
-            rm -f "$shard_file"
-            
-            # Track restored file
-            restored_shards+=("$restored_file")
-            ((processed_shards++))
-        done
-        
-        echo "  ✓ Wave $((wave_start/wave_size + 1)) completed ($processed_shards/$total_shards total)"
-        echo ""
-    done
+    } > "$fifo_path"
     
-    echo "✓ All $total_shards shards processed"
-    echo ""
+    # Wait for ZFS receive to complete
+    echo "  Waiting for ZFS receive to finish..."
+    wait $zfs_recv_pid
+    local zfs_recv_result=$?
     
-    # Reconstitute stream by sorting shards by byte offset
-    echo "Step 2: Reconstituting ZFS stream..."
-    echo "  Sorting ${#restored_shards[@]} shards by byte offset..."
+    # Clean up named pipe
+    rm -f "$fifo_path"
     
-    # Create array of restored shard files with their byte offsets
-    local sorted_shards=()
-    for restored_file in "${restored_shards[@]}"; do
-        [[ -f "$restored_file" ]] || continue
-        local offset=$(echo "$restored_file" | sed 's/.*-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.restored$/\1/')
-        sorted_shards+=("$offset:$restored_file")
-    done
-    
-    # Sort by byte offset (numeric sort on the offset part)
-    IFS=$'\n' sorted_shards=($(sort -t: -k1,1n <<< "${sorted_shards[*]}"))
-    
-    echo "  Concatenating ${#sorted_shards[@]} shards in byte order..."
-    > complete-stream.zfs  # Create empty file
-    for entry in "${sorted_shards[@]}"; do
-        local shard_file="${entry#*:}"
-        echo "    Adding: $shard_file"
-        cat "$shard_file" >> complete-stream.zfs
-        
-        # Clean up restored file immediately to save space
-        rm -f "$shard_file"
-    done
-    
-    local stream_size=$(stat -c%s complete-stream.zfs)
-    echo "Complete stream size: $(numfmt --to=iec $stream_size)"
-    
-    # ZFS receive
-    echo "Step 3: Performing ZFS receive..."
-    pv -s "$stream_size" -p -t -e -r -B 1M -N "ZFS Receive" complete-stream.zfs | zfs recv -F "$target_dataset"
+    if [[ $zfs_recv_result -eq 0 ]]; then
+        echo "  ✓ ZFS receive completed successfully"
+    else
+        echo "  ✗ ZFS receive failed with exit code: $zfs_recv_result"
+        return $zfs_recv_result
+    fi
     
     # Cleanup
     cd /
