@@ -506,6 +506,16 @@ stream_zfs_to_cloud() {
     # Create a temporary directory for named pipes only
     local pipe_dir=$(mktemp -d)
     local shard_pipe="$pipe_dir/shard_pipe"
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Temp directory: $pipe_dir"
+    
+    # Set up cleanup trap for interruptions
+    cleanup_temp_files() {
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     Cleaning up temp files due to interruption..."
+        kill $split_pid 2>/dev/null || true
+        rm -rf "$pipe_dir"
+        exit 1
+    }
+    trap cleanup_temp_files INT TERM
     
     # Create named pipe for streaming
     mkfifo "$shard_pipe"
@@ -569,17 +579,22 @@ stream_zfs_to_cloud() {
                 # Stream shard: compress -> encrypt -> upload
                 if gzip < "$shard_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
+                    # Immediately clean up temp file after successful upload
+                    rm -f "$shard_file"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Cleaned up temp file $shard_basename"
                 else
                     echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
+                    # Clean up temp file even on failure to prevent accumulation
+                    rm -f "$shard_file"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Cleaned up temp file $shard_basename (after failure)"
                     kill $split_pid 2>/dev/null || true
                     rm -rf "$pipe_dir"
                     return 1
                 fi
             fi
             
-            # Mark as processed and remove file
+            # Mark as processed
             processed_shards+=("$shard_basename")
-            rm -f "$shard_file"
             ((shard_num++))
             ((total_shards++))
         done
