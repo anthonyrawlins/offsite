@@ -582,9 +582,23 @@ stream_zfs_to_cloud() {
     local processed_count=0
     local upload_success=true
     
+    # Calculate bytes to skip for resumable backup
+    local bytes_to_skip=0
+    if [[ ${#existing_shards[@]} -gt 0 ]]; then
+        bytes_to_skip=$((${#existing_shards[@]} * dynamic_shard_size_bytes))
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     Resuming: skipping $bytes_to_skip bytes (${#existing_shards[@]} existing shards)"
+        shard_num=$((${#existing_shards[@]} + 1))
+    fi
+    
     # Create a custom streaming pipeline with controlled backpressure
     {
         eval "$zfs_cmd" | {
+            # Skip bytes for existing shards (resumable backup)
+            if [[ $bytes_to_skip -gt 0 ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S')     Skipping $bytes_to_skip bytes to resume from shard $shard_num"
+                dd bs="$dynamic_shard_size_bytes" count="${#existing_shards[@]}" of=/dev/null 2>/dev/null
+            fi
+            
             while true; do
                 local shard_file="$temp_dir/shard-$(printf "%03d" "$shard_num")"
                 local output_file="${backup_prefix}-s$(printf "%03d" "$shard_num").zfs.gz.age"
