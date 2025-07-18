@@ -797,10 +797,7 @@ upload_shard_to_all_providers() {
     local shard_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
     echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing shard $shard_num ($(numfmt --to=iec $shard_size)) to ${#SELECTED_PROVIDERS[@]} providers..."
     
-    # Create array to track background upload jobs
-    local upload_pids=()
-    
-    # Start parallel uploads to all providers
+    # Loop through all providers sequentially
     for prov in "${SELECTED_PROVIDERS[@]}"; do
         local rclone_remote="${PROVIDERS[$prov]}"
         local provider_name="${PROVIDER_NAMES[$prov]}"
@@ -809,17 +806,12 @@ upload_shard_to_all_providers() {
         if rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep -q "^${output_file}$"; then
             echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Shard $shard_num already exists on $provider_name"
         else
-            # Upload to this provider in background
-            upload_shard_to_provider "$shard_file" "$output_file" "$rclone_remote" "$dataset_path" "$agekey" "$provider_name" "$shard_num" &
-            upload_pids+=($!)
-        fi
-    done
-    
-    # Wait for all uploads to complete
-    for pid in "${upload_pids[@]}"; do
-        wait "$pid"
-        if [[ $? -ne 0 ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Upload failed for shard $shard_num to one provider"
+            # Upload to this provider
+            upload_shard_to_provider "$shard_file" "$output_file" "$rclone_remote" "$dataset_path" "$agekey" "$provider_name" "$shard_num"
+            if [[ $? -ne 0 ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Upload failed for shard $shard_num to $provider_name"
+                # Continue with other providers even if one fails
+            fi
         fi
     done
     
