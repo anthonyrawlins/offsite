@@ -523,15 +523,45 @@ is_backup_complete() {
         local final_size=${shard_sizes[$last_idx]}
         local previous_size=${shard_sizes[$second_last_idx]}
         
-        # Consider complete if final shard is less than 50% of previous shard size
-        # This accounts for compression variations while detecting true partial shards
-        local size_threshold=$((previous_size / 2))
+        # Detect completion by looking for pattern: large shard(s) followed by small metadata shards
+        # OR final shard significantly smaller than previous shard
         
-        if [[ $final_size -lt $size_threshold ]]; then
-            return 0  # Final shard is significantly smaller - backup complete
-        else
-            return 1  # All shards similar size - likely incomplete
+        local large_shard_threshold=1048576  # 1MB - distinguish data from metadata
+        local final_size=${shard_sizes[$last_idx]}
+        local previous_size=${shard_sizes[$second_last_idx]}
+        
+        # Find the largest shard (main data) and count small shards after it
+        local max_size=0
+        local max_size_idx=0
+        
+        for i in "${!shard_sizes[@]}"; do
+            if [[ ${shard_sizes[$i]} -gt $max_size ]]; then
+                max_size=${shard_sizes[$i]}
+                max_size_idx=$i
+            fi
+        done
+        
+        # Count small shards that come after the largest shard
+        local small_shards_after_main=0
+        local main_shard_threshold=$((max_size / 10))  # 10% of largest shard
+        
+        for i in "${!shard_sizes[@]}"; do
+            if [[ $i -gt $max_size_idx ]] && [[ ${shard_sizes[$i]} -lt $main_shard_threshold ]]; then
+                ((small_shards_after_main++))
+            fi
+        done
+        
+        # Pattern 1: One large shard followed by multiple small metadata shards
+        if [[ $small_shards_after_main -ge 2 ]]; then
+            return 0  # Complete: large data shard + multiple small metadata shards
         fi
+        
+        # Pattern 2: Final shard significantly smaller than largest shard (traditional partial)
+        if [[ $final_size -lt $main_shard_threshold ]]; then
+            return 0  # Traditional partial final shard
+        fi
+        
+        return 1  # Default to incomplete for safety
     fi
 }
 
