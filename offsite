@@ -634,8 +634,8 @@ stream_zfs_to_cloud() {
                 fi
             fi
             
-            # Clean up temp file immediately after processing
-            rm -f "$expected_shard"
+            # Don't delete temp file yet - let split finish all shards first
+            # rm -f "$expected_shard"  # Commented out - clean up after split completes
             ((processed_count++))
             ((shard_num++))
         else
