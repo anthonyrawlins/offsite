@@ -579,8 +579,10 @@ stream_zfs_to_cloud() {
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting streaming split and upload pipeline..."
     
     # Start split in background but monitor for complete shards
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting split process with PID..."
     eval "$zfs_cmd" | split -b "$dynamic_shard_size_bytes" --numeric-suffixes=1 --suffix-length=3 - "$temp_dir/shard-" &
     local split_pid=$!
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Split PID: $split_pid"
     
     # Only set trap after split is running to avoid interfering with it
     trap cleanup_temp_files EXIT
@@ -590,11 +592,13 @@ stream_zfs_to_cloud() {
     local upload_success=true
     
     # Monitor for shards and process them as they become available
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Monitoring for shards..."
     while kill -0 $split_pid 2>/dev/null || [[ -n "$(ls "$temp_dir"/shard-* 2>/dev/null)" ]]; do
         # Look for the next expected shard
         local expected_shard=$(printf "%s/shard-%03d" "$temp_dir" "$shard_num")
         
         if [[ -f "$expected_shard" ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S')     Found shard file: $expected_shard"
             # Wait a moment to ensure the shard is complete (split might still be writing to it)
             local initial_size=$(stat -c%s "$expected_shard" 2>/dev/null || echo "0")
             sleep 0.1
