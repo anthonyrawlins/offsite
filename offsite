@@ -717,11 +717,18 @@ stream_zfs_to_cloud() {
             # Skip bytes for resuming
             if [[ $bytes_to_skip -gt 0 ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S')     Skipping $bytes_to_skip bytes to resume from shard $shard_num"
-                # Use more efficient skipping with larger block sizes
-                dd bs=1048576 count=$((bytes_to_skip / 1048576)) of=/dev/null 2>/dev/null
-                local remaining_bytes=$((bytes_to_skip % 1048576))
-                if [[ $remaining_bytes -gt 0 ]]; then
-                    dd bs=1 count=$remaining_bytes of=/dev/null 2>/dev/null
+                # Use reliable block size for skipping
+                local skip_block_size=65536  # 64KB blocks
+                local skip_count=$((bytes_to_skip / skip_block_size))
+                local skip_remaining=$((bytes_to_skip % skip_block_size))
+                
+                echo "$(date '+%Y-%m-%d %H:%M:%S')     DEBUG: Skipping $skip_count blocks of $skip_block_size bytes + $skip_remaining remaining"
+                
+                if [[ $skip_count -gt 0 ]]; then
+                    dd bs="$skip_block_size" count="$skip_count" of=/dev/null 2>/dev/null
+                fi
+                if [[ $skip_remaining -gt 0 ]]; then
+                    dd bs=1 count="$skip_remaining" of=/dev/null 2>/dev/null
                 fi
                 current_byte_offset=$bytes_to_skip
             fi
@@ -731,14 +738,33 @@ stream_zfs_to_cloud() {
                 local output_file="${backup_prefix}-s$(printf "%03d" "$shard_num")-b$(printf "%010d" "$current_byte_offset").zfs.gz.age"
                 
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       Creating shard $shard_num..."
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       Running: dd bs=$dynamic_shard_size_bytes count=1 of=$shard_file"
+                
+                # Use smaller block size with multiple records for reliability
+                local block_size=65536  # 64KB - safe block size for dd
+                local record_count=$((dynamic_shard_size_bytes / block_size))
+                local remaining_bytes=$((dynamic_shard_size_bytes % block_size))
+                
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: dynamic_shard_size_bytes=$dynamic_shard_size_bytes"
+                echo "$(date '+%Y-%m-%d %H:%M:%S')       Running: dd bs=$block_size count=$record_count of=$shard_file"
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Pipeline status before dd: ${PIPESTATUS[*]}"
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Current shell process: $$"
                 
                 # Read exactly one shard worth of data (with backpressure)
                 local dd_result
-                dd_result=$(dd bs="$dynamic_shard_size_bytes" count=1 of="$shard_file" 2>&1)
+                dd_result=$(dd bs="$block_size" count="$record_count" of="$shard_file" 2>&1)
                 local dd_exit_code=$?
+                
+                # Handle remaining bytes if any
+                if [[ $remaining_bytes -gt 0 ]] && [[ $dd_exit_code -eq 0 ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Reading remaining $remaining_bytes bytes"
+                    local remaining_result
+                    remaining_result=$(dd bs=1 count="$remaining_bytes" of="$shard_file" conv=notrunc oflag=append 2>&1)
+                    local remaining_exit_code=$?
+                    dd_result="$dd_result"$'\n'"$remaining_result"
+                    if [[ $remaining_exit_code -ne 0 ]]; then
+                        dd_exit_code=$remaining_exit_code
+                    fi
+                fi
                 
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: dd raw output: $dd_result"
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       DEBUG: Pipeline status after dd: ${PIPESTATUS[*]}"
