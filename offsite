@@ -1169,7 +1169,7 @@ run_restore() {
             # Try providers in order of preference
             for prov in backblaze scaleway $(printf '%s\n' "${!PROVIDERS[@]}" | grep -v -E '^(backblaze|scaleway)$' | sort); do
                 local remote="${PROVIDERS[$prov]}"
-                if rclone lsf "${remote}/${dataset_path}/" 2>/dev/null | grep -q "^.*-x001.zfs.gz.age$"; then
+                if rclone lsf "${remote}/${dataset_path}/" 2>/dev/null | grep -q "^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$"; then
                     selected_remote="$remote"
                     provider_name="${PROVIDER_NAMES[$prov]} - auto-selected"
                     echo "Found backups on $prov"
@@ -1216,8 +1216,8 @@ run_restore() {
     if [[ "$backup_prefix" == "latest" ]] || [[ "$backup_prefix" == "latest-full" ]]; then
         echo "Discovering available backups..."
         
-        # Get all backup prefixes for this dataset
-        local all_backups=($(rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^(full|incr)-.*-x[0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-x[0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u | sort -t- -k3,3 || true))
+        # Get all backup prefixes for this dataset (new byte offset format)
+        local all_backups=($(rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || true))
         
         if [[ ${#all_backups[@]} -eq 0 ]]; then
             echo "ERROR: No backups found for dataset $source_dataset"
@@ -1225,23 +1225,11 @@ run_restore() {
         fi
         
         if [[ "$backup_prefix" == "latest-full" ]]; then
-            # Find latest full backup
-            local selected_backup=""
-            for backup in "${all_backups[@]}"; do
-                if [[ "$backup" =~ ^full- ]]; then
-                    selected_backup="$backup"
-                fi
-            done
-            
-            if [[ -z "$selected_backup" ]]; then
-                echo "ERROR: No full backups found for dataset $source_dataset"
-                exit 1
-            fi
-            
-            backup_prefix="$selected_backup"
-            echo "Selected latest full backup: $backup_prefix"
+            # In new format, all backups are "full" - just get the latest
+            backup_prefix="${all_backups[-1]}"
+            echo "Selected latest backup: $backup_prefix"
         else
-            # Find latest backup (incremental preferred)
+            # Find latest backup
             backup_prefix="${all_backups[-1]}"
             echo "Selected latest backup: $backup_prefix"
         fi
@@ -1253,18 +1241,18 @@ run_restore() {
         # User specified a specific backup - need to find the actual backup prefix
         echo "Searching for backup matching: $backup_prefix"
         
-        # Get all backup prefixes for this dataset
-        local all_backups=($(rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^(full|incr)-.*-x[0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-x[0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u | sort -t- -k3,3 || true))
+        # Get all backup prefixes for this dataset (new byte offset format)
+        local all_backups=($(rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || true))
         
         if [[ ${#all_backups[@]} -eq 0 ]]; then
             echo "ERROR: No backups found for dataset $source_dataset"
             exit 1
         fi
         
-        # Look for backup that ends with the specified snapshot name
+        # Look for backup that matches the specified snapshot name
         local found_backup=""
         for backup in "${all_backups[@]}"; do
-            if [[ "$backup" == "full-${backup_prefix}" ]] || [[ "$backup" == "incr-${backup_prefix}" ]]; then
+            if [[ "$backup" == "${source_dataset//\//_}:${backup_prefix}" ]]; then
                 found_backup="$backup"
                 break
             fi
@@ -1292,7 +1280,7 @@ run_restore() {
         echo "ERROR: No shards found for backup prefix: ${backup_prefix}"
         echo ""
         echo "Available backups for ${source_dataset}:"
-        rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^(full|incr)-.*-x[0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-x[0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || echo "No backups found"
+        rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || echo "No backups found"
         exit 1
     fi
     
@@ -1374,16 +1362,37 @@ run_restore() {
     echo "Step 2: Decrypting and decompressing shards..."
     for shard_file in "${shard_files[@]}"; do
         echo "  Processing: $shard_file"
-        # Extract the shard number from filename
-        local shard_num=$(echo "$shard_file" | sed 's/.*-s\([0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
+        # Extract the shard number and byte offset from new filename format
+        local shard_num=$(echo "$shard_file" | sed 's/.*-s\([0-9][0-9][0-9]\)-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$/\1/')
+        local byte_offset=$(echo "$shard_file" | sed 's/.*-s[0-9][0-9][0-9]-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
         local encrypted_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
-        pv -s "$encrypted_size" -p -t -e -r -B 1M -N "Decrypt shard $shard_num" "$shard_file" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip > "shard-${shard_num}.restored"
-        echo "    ✓ Restored: shard-${shard_num}.restored"
+        pv -s "$encrypted_size" -p -t -e -r -B 1M -N "Decrypt shard $shard_num" "$shard_file" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip > "shard-${shard_num}-b${byte_offset}.restored"
+        echo "    ✓ Restored: shard-${shard_num}-b${byte_offset}.restored"
     done
     
-    # Reconstitute stream
+    # Reconstitute stream by sorting shards by byte offset
     echo "Step 3: Reconstituting ZFS stream..."
-    cat shard-*.restored > complete-stream.zfs
+    echo "  Sorting shards by byte offset..."
+    
+    # Create array of restored shard files with their byte offsets
+    local sorted_shards=()
+    for restored_file in shard-*-b*.restored; do
+        [[ -f "$restored_file" ]] || continue
+        local offset=$(echo "$restored_file" | sed 's/.*-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.restored$/\1/')
+        sorted_shards+=("$offset:$restored_file")
+    done
+    
+    # Sort by byte offset (numeric sort on the offset part)
+    IFS=$'\n' sorted_shards=($(sort -t: -k1,1n <<< "${sorted_shards[*]}"))
+    
+    echo "  Concatenating ${#sorted_shards[@]} shards in byte order..."
+    > complete-stream.zfs  # Create empty file
+    for entry in "${sorted_shards[@]}"; do
+        local shard_file="${entry#*:}"
+        echo "    Adding: $shard_file"
+        cat "$shard_file" >> complete-stream.zfs
+    done
+    
     local stream_size=$(stat -c%s complete-stream.zfs)
     echo "Complete stream size: $(numfmt --to=iec $stream_size)"
     
@@ -1422,7 +1431,7 @@ run_list() {
     
     # Provider selection (same logic as backup)
     if [[ "$provider" == "all" ]]; then
-        SELECTED_PROVIDERS=($(printf '%s\n' "${\!PROVIDERS[@]}"  < /dev/null |  sort))
+        SELECTED_PROVIDERS=($(printf '%s\n' "${!PROVIDERS[@]}" | sort))
     else
         case "$provider" in
             bb) provider="backblaze" ;;
