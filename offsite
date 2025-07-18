@@ -1425,19 +1425,19 @@ run_restore() {
             # Stream: download → decrypt → decompress → stream
             # Each step shows its icon when it starts processing
             (
-                echo -n " ⬇️" >&2  # Download started
+                echo -n " ⬇️ " >&2  # Download started
                 rclone cat "${remote_path}/${shard_file}"
             ) | (
-                echo -n " 🔐" >&2  # Decrypt started
+                echo -n "🔐 " >&2  # Decrypt started
                 age -d -i "$AGE_PRIVATE_KEY_FILE"
             ) | (
-                echo -n " 📦" >&2  # Decompress started
+                echo -n "📦 " >&2  # Decompress started
                 gunzip
             ) | (
-                echo -n " ➡️" >&2  # Stream started
+                echo -n "➡️ " >&2  # Stream started
                 cat
             )
-            echo " ✅" >&2  # Complete
+            echo "✅" >&2  # Complete
         done
     } | zfs recv -F "$target_dataset"
     
