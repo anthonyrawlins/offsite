@@ -723,6 +723,12 @@ stream_zfs_to_cloud_parallel() {
             local shard_num=$min_missing_shard
             local processed_count=0
             
+            # Recreate missing shard map in subshell due to scoping
+            declare -A missing_shard_map
+            for shard in "${missing_shards[@]}"; do
+                missing_shard_map[$shard]=1
+            done
+            
             # Skip to first missing shard position
             if [[ $bytes_to_skip -gt 0 ]]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S')     Skipping $bytes_to_skip bytes to reach first missing shard"
@@ -752,9 +758,9 @@ stream_zfs_to_cloud_parallel() {
                 fi
                 
                 # Only upload if this shard is actually missing
-                if [[ -n "${missing_shard_map[$shard_num]}" ]]; then
+                if [[ -n "${missing_shard_map[$shard_num]:-}" ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       Creating missing shard $shard_num..."
-                    # Upload this shard to all providers in parallel
+                    # Upload this shard to all providers
                     upload_shard_to_all_providers "$shard_file" "$output_file" "$dataset_path" "$agekey" "$shard_num" &
                 else
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       Shard $shard_num exists on all providers - skipping"
