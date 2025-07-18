@@ -1420,12 +1420,23 @@ run_restore() {
     {
         for entry in "${sorted_shards[@]}"; do
             local shard_file="${entry#*:}"
-            echo "    Processing: $shard_file" >&2
+            echo -n "    Processing: $shard_file" >&2
             
             # Stream: download → decrypt → decompress
-            rclone cat "${remote_path}/${shard_file}" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip
+            echo -n " 📡" >&2  # Download
+            rclone cat "${remote_path}/${shard_file}" | {
+                echo -n " 🔓" >&2  # Decrypt
+                age -d -i "$AGE_PRIVATE_KEY_FILE" | {
+                    echo -n " 📦" >&2  # Decompress
+                    gunzip | {
+                        echo -n " 📤" >&2  # Stream
+                        cat
+                    }
+                }
+            }
+            echo " ✓" >&2  # Complete
         done
-    } | pv -p -t -e -r -B 1M -N "ZFS Receive" | zfs recv -F "$target_dataset"
+    } | zfs recv -F "$target_dataset"
     
     local zfs_recv_result=$?
     
