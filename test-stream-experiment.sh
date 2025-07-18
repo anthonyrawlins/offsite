@@ -100,8 +100,17 @@ echo "Our current calculation: $(numfmt --to=iec $WRONG_BYTES_TO_SKIP)"
 
 echo ""
 echo "Testing dd skip with correct bytes..."
-dd bs=1 count=$ACTUAL_BYTES_TO_SKIP if=stream1.zfs of=/dev/null 2>/dev/null
-dd bs=1 skip=$ACTUAL_BYTES_TO_SKIP if=stream1.zfs of=remaining-correct.zfs 2>/dev/null
+echo "Stream size: $STREAM1_SIZE bytes"
+echo "Trying to skip: $ACTUAL_BYTES_TO_SKIP bytes"
+
+if [[ $ACTUAL_BYTES_TO_SKIP -ge $STREAM1_SIZE ]]; then
+    echo "ERROR: Trying to skip more bytes than stream contains!"
+    echo "This would cause dd to hang or fail"
+else
+    echo "Skip is within stream bounds, testing..."
+    timeout 10 dd bs=1 count=$ACTUAL_BYTES_TO_SKIP if=stream1.zfs of=/dev/null 2>/dev/null || echo "dd count timed out"
+    timeout 10 dd bs=1 skip=$ACTUAL_BYTES_TO_SKIP if=stream1.zfs of=remaining-correct.zfs 2>/dev/null || echo "dd skip timed out"
+fi
 
 echo "Testing dd skip with our wrong calculation..."
 if [[ $WRONG_BYTES_TO_SKIP -lt $STREAM1_SIZE ]]; then
