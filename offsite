@@ -1416,26 +1416,81 @@ run_restore() {
     
     local total_shards=${#sorted_shards[@]}
     
-    # Stream shards directly to ZFS receive (no temp files to maintain stream continuity)
-    # This is the proven working approach with visual feedback
+    # Stream shards with visual pipeline display
+    # Show 5-stage pipeline: download → decrypt → decompress → stream → complete
+    local pipeline_display_size=5
+    local display_lines=()
+    
+    # Initialize display with first few shards
+    for ((i=0; i<pipeline_display_size && i<total_shards; i++)); do
+        local entry="${sorted_shards[$i]}"
+        local shard_file="${entry#*:}"
+        display_lines[$i]="    Processing: $shard_file"
+    done
+    
+    # Function to update display
+    update_display() {
+        local current_index="$1"
+        local stage="$2"
+        
+        # Clear previous display
+        if [[ ${#display_lines[@]} -gt 0 ]]; then
+            printf "\033[%dA" "${#display_lines[@]}" >&2  # Move cursor up
+        fi
+        
+        # Update current line with new stage
+        case "$stage" in
+            "download") display_lines[$current_index]="${display_lines[$current_index]} ⬇️ " ;;
+            "decrypt") display_lines[$current_index]="${display_lines[$current_index]}🔐 " ;;
+            "decompress") display_lines[$current_index]="${display_lines[$current_index]}📦 " ;;
+            "stream") display_lines[$current_index]="${display_lines[$current_index]}➡️ " ;;
+            "complete") display_lines[$current_index]="${display_lines[$current_index]} ✅" ;;
+        esac
+        
+        # Add new shard line if needed
+        if [[ "$stage" == "download" ]] && [[ $((current_index + pipeline_display_size)) -lt $total_shards ]]; then
+            local new_index=$((current_index + pipeline_display_size))
+            local entry="${sorted_shards[$new_index]}"
+            local shard_file="${entry#*:}"
+            display_lines[$new_index]="    Processing: $shard_file"
+        fi
+        
+        # Print current display
+        for line in "${display_lines[@]}"; do
+            if [[ -n "$line" ]]; then
+                echo "$line" >&2
+            fi
+        done
+    }
+    
+    # Show initial display
+    for line in "${display_lines[@]}"; do
+        echo "$line" >&2
+    done
+    
+    # Process shards with visual pipeline
     {
+        local current_index=0
         for entry in "${sorted_shards[@]}"; do
             local shard_file="${entry#*:}"
-            echo -n "    Processing: $shard_file" >&2
-            echo -n " ⬇️  " >&2  # Download started
+            
+            # Update display for each stage
+            update_display "$current_index" "download"
             
             # Direct streaming: download → decrypt → decompress
             rclone cat "${remote_path}/${shard_file}" | {
-                echo -n "🔐  " >&2  # Decrypt started
+                update_display "$current_index" "decrypt"
                 age -d -i "$AGE_PRIVATE_KEY_FILE" | {
-                    echo -n "📦  " >&2  # Decompress started
+                    update_display "$current_index" "decompress"
                     gunzip | {
-                        echo -n "➡️  " >&2  # Stream started
+                        update_display "$current_index" "stream"
                         cat
                     }
                 }
             }
-            echo " ✅" >&2  # Complete
+            update_display "$current_index" "complete"
+            
+            ((current_index++))
         done
     } | zfs recv -F "$target_dataset"
     
