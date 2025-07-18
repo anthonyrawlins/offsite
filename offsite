@@ -557,172 +557,89 @@ stream_zfs_to_cloud() {
         echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: ${size_mb}MB (${estimated_shards} shards of ${shard_size_human} each)"
     fi
     
-    # Stream with minimal temp space - use named pipes for zero-copy streaming
-    local shard_num=1
-    local total_shards=0
+    # Simple approach: split first, then process each shard (avoids race conditions)
+    local temp_dir=$(mktemp -d)
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Temp directory: $temp_dir"
     
-    # Create a temporary directory for named pipes only
-    local pipe_dir=$(mktemp -d)
-    local shard_pipe="$pipe_dir/shard_pipe"
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Temp directory: $pipe_dir"
-    
-    # Set up cleanup trap for interruptions (but don't interfere with child processes)
+    # Cleanup function
     cleanup_temp_files() {
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Cleaning up temp files due to interruption..."
-        kill $split_pid 2>/dev/null || true
-        rm -rf "$pipe_dir"
-        exit 1
+        rm -rf "$temp_dir" 2>/dev/null || true
     }
-    # Only trap EXIT to avoid interfering with zfs send process
-    trap "cleanup_temp_files" EXIT
+    trap cleanup_temp_files EXIT
     
-    # Create named pipe for streaming
-    mkfifo "$shard_pipe"
+    # Simple approach: split first, then process each shard
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Creating shards..."
+    if ! eval "$zfs_cmd" | split -b "$dynamic_shard_size_bytes" --numeric-suffixes=1 --suffix-length=3 - "$temp_dir/shard-"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✗ Failed to create shards"
+        cleanup_temp_files
+        return 1
+    fi
     
-    # Background process to handle sharding
-    {
-        eval "$zfs_cmd" | split -b "$dynamic_shard_size_bytes" --numeric-suffixes=1 --suffix-length=3 - "$pipe_dir/shard-"
-        echo "SPLIT_DONE" > "$shard_pipe"
-    } &
-    local split_pid=$!
+    # Get list of created shards
+    local shard_files=($(ls "$temp_dir"/shard-* 2>/dev/null | sort))
+    if [[ ${#shard_files[@]} -eq 0 ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✗ No shards were created"
+        cleanup_temp_files
+        return 1
+    fi
     
-    # Process shards as they appear - wait for complete shards
-    local processed_shards=()
-    while true; do
-        # Get list of shard files
-        local current_shards=($(ls "$pipe_dir"/shard-* 2>/dev/null | sort))
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Created ${#shard_files[@]} shards, now uploading..."
+    
+    # Process each shard
+    local shard_num=1
+    local upload_success=true
+    
+    for shard_file in "${shard_files[@]}"; do
+        local shard_basename=$(basename "$shard_file")
+        local shard_suffix="${shard_basename#shard-}"
+        local output_file="${backup_prefix}-s${shard_suffix}.zfs.gz.age"
         
-        # Process any new complete shards
-        for shard_file in "${current_shards[@]}"; do
-            [[ -f "$shard_file" ]] || continue
+        # Check if shard already exists (resumable backup)
+        if printf '%s\n' "${existing_shards[@]}" | grep -q "^${output_file}$"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S')       ✓ Shard $shard_num of ${#shard_files[@]} already exists: $output_file"
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing shard $shard_num of ${#shard_files[@]}..."
             
-            # Skip if already processed
-            local shard_basename=$(basename "$shard_file")
-            if printf '%s\n' "${processed_shards[@]}" | grep -q "^${shard_basename}$"; then
-                continue
-            fi
+            # Get shard file size for progress bar
+            local shard_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
             
-            # Wait for shard to be completely written by checking if it's still growing
-            local initial_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
-            sleep 0.1
-            local final_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
-            
-            # If file is still growing, skip for now
-            if [[ $initial_size -ne $final_size ]]; then
-                continue
-            fi
-            
-            # If split is still running and this isn't the last shard, wait a bit more
-            if kill -0 $split_pid 2>/dev/null; then
-                # Check if there might be more shards coming
-                local next_shard_num=$(printf "%03d" $((10#${shard_basename#shard-} + 1)))
-                if [[ ! -f "$pipe_dir/shard-$next_shard_num" ]]; then
-                    # Wait a bit more to ensure shard is complete
-                    sleep 0.2
-                    local verify_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
-                    if [[ $final_size -ne $verify_size ]]; then
-                        continue  # Still growing
-                    fi
-                fi
-            fi
-            
-            # Now process the complete shard
-            local output_file="${backup_prefix}-s${shard_basename#shard-}.zfs.gz.age"
-            
-            # Check if shard already exists (resumable backup)
-            if printf '%s\n' "${existing_shards[@]}" | grep -q "^${output_file}$"; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       ✓ Shard $shard_num of ~$estimated_shards already exists: $output_file"
-            else
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing shard $shard_num of ~$estimated_shards..."
-                
-                # Get shard file size for progress bar
-                local shard_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
-                
-                # Stream shard: compress -> encrypt -> upload with progress bar
-                if command -v pv >/dev/null 2>&1; then
-                    # Use pv for progress bar if available
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading $(numfmt --to=iec $shard_size)..."
-                    if pv -s "$shard_size" "$shard_file" | gzip | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
-                        upload_success=true
-                    else
-                        upload_success=false
-                    fi
-                else
-                    # Fallback without progress bar
-                    if gzip < "$shard_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
-                        upload_success=true
-                    else
-                        upload_success=false
-                    fi
-                fi
-                
-                if [[ "$upload_success" == "true" ]]; then
+            # Stream shard: compress -> encrypt -> upload with progress bar
+            if command -v pv >/dev/null 2>&1; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading $(numfmt --to=iec $shard_size)..."
+                if pv -s "$shard_size" "$shard_file" | gzip | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
-                    # Immediately clean up temp file after successful upload
-                    rm -f "$shard_file"
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Cleaned up temp file $shard_basename"
                 else
                     echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
-                    # Clean up temp file even on failure to prevent accumulation
-                    rm -f "$shard_file"
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Cleaned up temp file $shard_basename (after failure)"
-                    kill $split_pid 2>/dev/null || true
-                    rm -rf "$pipe_dir"
-                    return 1
+                    upload_success=false
+                    break
+                fi
+            else
+                # Fallback without progress bar
+                if gzip < "$shard_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
+                else
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
+                    upload_success=false
+                    break
                 fi
             fi
-            
-            # Mark as processed
-            processed_shards+=("$shard_basename")
-            ((shard_num++))
-            ((total_shards++))
-        done
-        
-        # Check if split is done
-        if ! kill -0 $split_pid 2>/dev/null; then
-            # Process any remaining shards
-            for shard_file in "$pipe_dir"/shard-*; do
-                [[ -f "$shard_file" ]] || continue
-                
-                local shard_basename=$(basename "$shard_file")
-                if printf '%s\n' "${processed_shards[@]}" | grep -q "^${shard_basename}$"; then
-                    continue
-                fi
-                
-                local output_file="${backup_prefix}-s${shard_basename#shard-}.zfs.gz.age"
-                
-                if ! printf '%s\n' "${existing_shards[@]}" | grep -q "^${output_file}$"; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing final shard $shard_num of ~$estimated_shards..."
-                    
-                    # Get shard file size for progress bar
-                    local shard_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
-                    
-                    # Upload final shard with progress bar if available
-                    if command -v pv >/dev/null 2>&1; then
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading final $(numfmt --to=iec $shard_size)..."
-                        pv -s "$shard_size" "$shard_file" | gzip | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"
-                    else
-                        gzip < "$shard_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"
-                    fi
-                    ((total_shards++))
-                fi
-                rm -f "$shard_file"
-            done
-            break
         fi
         
-        # Small delay before checking again
-        sleep 0.2
+        # Clean up temp file immediately after processing
+        rm -f "$shard_file"
+        ((shard_num++))
     done
     
-    # Cleanup
-    rm -rf "$pipe_dir"
+    # Clean up temp directory
+    cleanup_temp_files
+    trap - EXIT
     
-    # Show completion with actual vs estimated
-    if [[ $total_shards -eq $estimated_shards ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming complete: $total_shards shards processed (as estimated)"
+    if [[ "$upload_success" == "true" ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming backup complete: ${#shard_files[@]} shards uploaded"
+        return 0
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming complete: $total_shards shards processed (estimated $estimated_shards)"
+        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✗ Backup failed during upload"
+        return 1
     fi
 }
 
