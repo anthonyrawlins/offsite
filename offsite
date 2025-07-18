@@ -183,6 +183,13 @@ command -v zfs >/dev/null || { echo "ERROR: zfs not installed"; exit 1; }
 command -v rclone >/dev/null || { echo "ERROR: rclone not installed"; exit 1; }
 command -v age >/dev/null || { echo "ERROR: age not installed"; exit 1; }
 
+# Check for optional tools and suggest installation
+if ! command -v pv >/dev/null 2>&1; then
+    echo "INFO: pv (pipe viewer) not found - install for upload progress bars"
+    echo "      Ubuntu/Debian: sudo apt install pv"
+    echo "      RHEL/CentOS: sudo yum install pv"
+fi
+
 # === DELEGATE TO OPERATION ===
 case "$OPERATION" in
     backup)
@@ -576,8 +583,28 @@ stream_zfs_to_cloud() {
             else
                 echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing shard $shard_num of ~$estimated_shards..."
                 
-                # Stream shard: compress -> encrypt -> upload
-                if gzip < "$shard_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
+                # Get shard file size for progress bar
+                local shard_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
+                
+                # Stream shard: compress -> encrypt -> upload with progress bar
+                if command -v pv >/dev/null 2>&1; then
+                    # Use pv for progress bar if available
+                    echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading $(numfmt --to=iec $shard_size)..."
+                    if pv -s "$shard_size" "$shard_file" | gzip | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
+                        upload_success=true
+                    else
+                        upload_success=false
+                    fi
+                else
+                    # Fallback without progress bar
+                    if gzip < "$shard_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
+                        upload_success=true
+                    else
+                        upload_success=false
+                    fi
+                fi
+                
+                if [[ "$upload_success" == "true" ]]; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
                     # Immediately clean up temp file after successful upload
                     rm -f "$shard_file"
@@ -614,7 +641,17 @@ stream_zfs_to_cloud() {
                 
                 if ! printf '%s\n' "${existing_shards[@]}" | grep -q "^${output_file}$"; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing final shard $shard_num of ~$estimated_shards..."
-                    gzip < "$shard_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"
+                    
+                    # Get shard file size for progress bar
+                    local shard_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
+                    
+                    # Upload final shard with progress bar if available
+                    if command -v pv >/dev/null 2>&1; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading final $(numfmt --to=iec $shard_size)..."
+                        pv -s "$shard_size" "$shard_file" | gzip | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"
+                    else
+                        gzip < "$shard_file" | age -r "$agekey" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"
+                    fi
                     ((total_shards++))
                 fi
                 rm -f "$shard_file"
