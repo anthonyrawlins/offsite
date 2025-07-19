@@ -440,7 +440,11 @@ backup_all_providers_parallel() {
     local snap="$2"
     local dataset_path="${dataset//\//_}"
     
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [+] Starting parallel backup to ${#SELECTED_PROVIDERS[@]} providers: ${SELECTED_PROVIDERS[*]}"
+        if [[ ${#SELECTED_PROVIDERS[@]} -gt 1 ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [+] Starting parallel backup to ${#SELECTED_PROVIDERS[@]} providers: ${SELECTED_PROVIDERS[*]}"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [+] Starting backup to provider: ${SELECTED_PROVIDERS[0]}"
+    fi
     
     # Always perform full backups - simpler and more reliable
     echo "$(date '+%Y-%m-%d %H:%M:%S')     Performing full backup"
@@ -453,8 +457,7 @@ backup_all_providers_parallel() {
     local dataset_clean="${dataset//\//_}"  # rust/test -> rust_test
     local backup_prefix="${dataset_clean}:${snap}"  # rust_test:now
     
-    # Call the new parallel streaming function
-    stream_zfs_to_all_providers "${dataset}@${snap}" "$backup_prefix" "$dataset_path" "$agekey"
+    stream_zfs_to_cloud "${dataset}@${snap}" "$backup_prefix" "$dataset_path" "$agekey"
     
     echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Parallel backup complete to all providers"
 }
@@ -492,304 +495,123 @@ backup_single_provider() {
     echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Backup complete to $provider_name"
 }
 
-# Check if a backup is complete by verifying the final shard is smaller than expected
+# Check if a backup is complete by comparing uploaded size to dataset size
 is_backup_complete() {
     local rclone_remote="$1"
-    local dataset_path="$2" 
+    local dataset_path="$2"
     local backup_prefix="$3"
-    
+    local original_dataset_size="$4"
+    local shard_size="$5"
+
     # Get all shards for this backup with size information
-    local shard_list=$(rclone lsf "${rclone_remote}/${dataset_path}/" --format "sp" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age ")
-    
-    if [[ -z "$shard_list" ]]; then
+    local shard_list_output=$(rclone lsf "${rclone_remote}/${dataset_path}/" --format "sp" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age ")
+
+    if [[ -z "$shard_list_output" ]]; then
         return 1  # No shards found
     fi
-    
-    # Parse shards into array with sizes
-    local all_shards=()
+
     local shard_sizes=()
-    
+    local total_uploaded_size=0
     while IFS= read -r line; do
         local size=$(echo "$line" | awk '{print $1}')
-        local name=$(echo "$line" | awk '{print $2}')
-        all_shards+=("$name")
         shard_sizes+=("$size")
-    done <<< "$shard_list"
-    
-    # Sort by shard number (they should already be sorted, but ensure it)
-    local sorted_indices=($(for i in "${!all_shards[@]}"; do echo "$i ${all_shards[$i]}"; done | sort -k2 | awk '{print $1}'))
-    
-    local shard_count=${#all_shards[@]}
-    
+        total_uploaded_size=$((total_uploaded_size + size))
+    done <<< "$shard_list_output"
+
+    local shard_count=${#shard_sizes[@]}
     if [[ $shard_count -eq 0 ]]; then
-        return 1  # No shards
-    elif [[ $shard_count -eq 1 ]]; then
-        # Single shard - check if it's shard 100 (complete) or very small (single-shard backup)
-        local shard_name="${all_shards[0]}"
-        local shard_number=$(echo "$shard_name" | sed -E 's/.*-s([0-9]{3})\.zfs\.gz\.age$/\1/')
-        
-        if [[ $shard_number == "100" ]]; then
-            return 0  # Reached target shard 100
-        else
-            # Single non-100 shard - assume incomplete for safety
-            return 1
-        fi
-    else
-        # Multiple shards - check if final shard is significantly smaller
-        local last_idx=${sorted_indices[-1]}
-        local second_last_idx=${sorted_indices[-2]}
-        
-        local final_size=${shard_sizes[$last_idx]}
-        local previous_size=${shard_sizes[$second_last_idx]}
-        
-        # Detect completion by looking for pattern: large shard(s) followed by small metadata shards
-        # OR final shard significantly smaller than previous shard
-        
-        local large_shard_threshold=1048576  # 1MB - distinguish data from metadata
-        local final_size=${shard_sizes[$last_idx]}
-        local previous_size=${shard_sizes[$second_last_idx]}
-        
-        # Find the largest shard (main data) and count small shards after it
-        local max_size=0
-        local max_size_idx=0
-        
-        for i in "${!shard_sizes[@]}"; do
-            if [[ ${shard_sizes[$i]} -gt $max_size ]]; then
-                max_size=${shard_sizes[$i]}
-                max_size_idx=$i
-            fi
-        done
-        
-        # Count small shards that come after the largest shard
-        local small_shards_after_main=0
-        local main_shard_threshold=$((max_size / 10))  # 10% of largest shard
-        
-        for i in "${!shard_sizes[@]}"; do
-            if [[ $i -gt $max_size_idx ]] && [[ ${shard_sizes[$i]} -lt $main_shard_threshold ]]; then
-                ((small_shards_after_main++))
-            fi
-        done
-        
-        # Pattern 1: One large shard followed by multiple small metadata shards
-        if [[ $small_shards_after_main -ge 2 ]]; then
-            return 0  # Complete: large data shard + multiple small metadata shards
-        fi
-        
-        # Pattern 2: Final shard significantly smaller than largest shard (traditional partial)
-        if [[ $final_size -lt $main_shard_threshold ]]; then
-            return 0  # Traditional partial final shard
-        fi
-        
-        return 1  # Default to incomplete for safety
+        return 1 # No shards
     fi
+
+    local last_shard_size=${shard_sizes[-1]}
+
+    # Case 1: The last shard is smaller than the regular shard size.
+    # This is the most reliable indicator of a complete backup.
+    if [[ $last_shard_size -lt $shard_size ]]; then
+        return 0 # COMPLETE: Final shard is smaller than a full shard.
+    fi
+
+    # Case 2: The last shard is full-sized. This could be an incomplete backup,
+    # or a backup that ended exactly on a shard boundary.
+    # We compare the total uploaded size to the original dataset size.
+    # ZFS send streams are often smaller than `zfs get used`, so we use a threshold (e.g., 95%).
+    local completion_percentage=95
+    local required_size=$((original_dataset_size * completion_percentage / 100))
+
+    if [[ $total_uploaded_size -ge $required_size ]]; then
+        # The total size is large enough. We can be reasonably sure it's complete,
+        # even if the last shard is full. This handles backups that end on a boundary.
+        return 0 # COMPLETE: Total size is over 95% of original dataset size.
+    fi
+
+    # Case 3: If we are here, we have one or more full-sized shards, but the total size is
+    # less than 95% of the dataset size. This is the classic "incomplete" case.
+    return 1 # INCOMPLETE: Not enough data uploaded.
 }
 
-# Streaming ZFS backup function - no temp files needed!
-stream_zfs_to_all_providers() {
+
+
+
+
+# New, simplified streaming function that streams the entire dataset from start to finish.
+# It relies on the upload_shard_to_all_providers function to intelligently skip existing shards.
+stream_zfs_to_cloud() {
     local current_snap="$1"
     local backup_prefix="$2"
     local dataset_path="$3"
     local agekey="$4"
-    
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting streaming backup (full)"
-    
-    # Get all existing shards from all providers and build missing shard list
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Checking for existing shards across all providers..."
-    local missing_shards=()
-    local max_shard_found=0
-    
-    # Create associative arrays to track which shards exist on which providers
-    declare -A provider_shards
-    
-    for prov in "${SELECTED_PROVIDERS[@]}"; do
-        local rclone_remote="${PROVIDERS[$prov]}"
-        local provider_shard_list=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" | sort || true))
-        
-        provider_shards[$prov]="${provider_shard_list[*]}"
-        
-        # Find max shard number to know the range to check
-        for shard in "${provider_shard_list[@]}"; do
-            local shard_num=$(echo "$shard" | sed -E 's/.*-s([0-9]{3})-b.*/\1/' | sed 's/^0*//')
-            if [[ $shard_num -gt $max_shard_found ]]; then
-                max_shard_found=$shard_num
-            fi
-        done
-    done
-    
-    if [[ $max_shard_found -gt 0 ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S')       Found shards up to shard $max_shard_found, checking for gaps..."
-        
-        # Check each shard from 1 to max_shard_found to find missing ones
-        for ((i=1; i<=max_shard_found; i++)); do
-            local shard_pattern="${backup_prefix}-s$(printf "%03d" "$i")-b"
-            local missing_on_any_provider=false
-            
-            for prov in "${SELECTED_PROVIDERS[@]}"; do
-                local found_on_provider=false
-                if [[ "${provider_shards[$prov]}" == *"$shard_pattern"* ]]; then
-                    found_on_provider=true
-                fi
-                
-                if [[ "$found_on_provider" == "false" ]]; then
-                    missing_on_any_provider=true
-                    break
-                fi
-            done
-            
-            if [[ "$missing_on_any_provider" == "true" ]]; then
-                missing_shards+=($i)
-            fi
-        done
-        
-        if [[ ${#missing_shards[@]} -gt 0 ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S')       Found ${#missing_shards[@]} missing shards: ${missing_shards[*]}"
-        else
-            echo "$(date '+%Y-%m-%d %H:%M:%S')       All existing shards complete across all providers"
-        fi
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S')       No existing shards found - starting fresh backup"
-        missing_shards=(1)  # Start with shard 1
-    fi
-    
-    # Call the parallel streaming function with missing shard list
-    stream_zfs_to_cloud_parallel "$current_snap" "$backup_prefix" "$dataset_path" "$agekey" "${missing_shards[*]}"
-}
 
-stream_zfs_to_cloud_parallel() {
-    local current_snap="$1"
-    local backup_prefix="$2"
-    local dataset_path="$3"
-    local agekey="$4"
-    local missing_shards_str="$5"
-    
-    # Convert missing shards string back to array
-    local missing_shards=($missing_shards_str)
-    
-    if [[ ${#missing_shards[@]} -eq 0 ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     No missing shards - backup already complete!"
-        return 0
-    fi
-    
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Processing ${#missing_shards[@]} missing shards: ${missing_shards[*]}"
-    
-    # Get dataset size for shard calculation
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting unified streaming backup..."
+
+    # Get dataset size for shard calculation and progress bar
     local dataset_size_bytes=$(zfs get -H -o value -p used "${current_snap%@*}" 2>/dev/null || echo "1073741824")
     local dynamic_shard_size_bytes=$((dataset_size_bytes / 100))
     local min_shard_size=$((10 * 1024 * 1024))       # 10MB minimum
-    local max_shard_size=$((5 * 1024 * 1024 * 1024))  # 5GB maximum
-    
+    local max_shard_size=$((1 * 1024 * 1024 * 1024))  # 1GB maximum
+
     if [[ $dynamic_shard_size_bytes -lt $min_shard_size ]]; then
         dynamic_shard_size_bytes=$min_shard_size
     elif [[ $dynamic_shard_size_bytes -gt $max_shard_size ]]; then
         dynamic_shard_size_bytes=$max_shard_size
     fi
-    
-    # Create temp directory for this backup session
-    local temp_dir=$(mktemp -d)
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Temp directory: $temp_dir"
-    
-    # Cleanup function
-    cleanup_temp_files() {
-        rm -rf "$temp_dir"
-    }
-    trap cleanup_temp_files EXIT
-    
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting parallel streaming backup..."
-    
-    # Convert missing shards to associative array for quick lookup
-    declare -A missing_shard_map
-    for shard in "${missing_shards[@]}"; do
-        missing_shard_map[$shard]=1
-    done
-    
-    # Find the minimum missing shard to start streaming from
-    local min_missing_shard=${missing_shards[0]}
-    for shard in "${missing_shards[@]}"; do
-        if [[ $shard -lt $min_missing_shard ]]; then
-            min_missing_shard=$shard
-        fi
-    done
-    
-    # Calculate bytes to skip to reach first missing shard
-    local bytes_to_skip=$(((min_missing_shard - 1) * dynamic_shard_size_bytes))
-    
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting stream from shard $min_missing_shard (skipping $bytes_to_skip bytes)"
-    
-    # Create streaming pipeline that only processes missing shards
-    {
-        zfs send "$current_snap" | pv -s "$dataset_size_bytes" -p -t -e -r -B 1M -N "ZFS Stream" | {
-            local current_byte_offset=$bytes_to_skip
-            local shard_num=$min_missing_shard
-            local processed_count=0
+
+    temp_dir=$(mktemp -d)
+    trap 'rm -rf "$temp_dir"' EXIT
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     Streaming from ZFS snapshot..."
+
+    # This pipeline streams the entire ZFS send and processes it shard by shard.
+    zfs send "$current_snap" | pv -s "$dataset_size_bytes" | {
+        local shard_num=1
+        local current_byte_offset=0
+
+        while true; do
+            local shard_file="$temp_dir/shard-$(printf "%03d" "$shard_num")"
             
-            # Recreate missing shard map in subshell due to scoping
-            declare -A missing_shard_map
-            for shard in "${missing_shards[@]}"; do
-                missing_shard_map[$shard]=1
-            done
-            
-            # Skip to first missing shard position
-            if [[ $bytes_to_skip -gt 0 ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S')     Skipping $bytes_to_skip bytes to reach first missing shard"
-                # Use head to discard the bytes we want to skip
-                head -c "$bytes_to_skip" > /dev/null
+            # Read one shard's worth of data. head is more reliable than dd for this.
+            bytes_read=$(head -c "$dynamic_shard_size_bytes" | tee "$shard_file" | wc -c)
+
+            if [[ $bytes_read -eq 0 ]]; then
+                rm -f "$shard_file"
+                break # End of stream
             fi
+
+            local output_file="${backup_prefix}-s$(printf "%03d" "$shard_num")-b$(printf "%020d" "$current_byte_offset").zfs.gz.age"
             
-            while true; do
-                local shard_file="$temp_dir/shard-$(printf "%03d" "$shard_num")"
-                local output_file="${backup_prefix}-s$(printf "%03d" "$shard_num")-b$(printf "%010d" "$current_byte_offset").zfs.gz.age"
-                
-                # Read exactly one shard worth of data
-                local head_result
-                head_result=$(head -c "$dynamic_shard_size_bytes" > "$shard_file" 2>&1)
-                local head_exit_code=$?
-                
-                # Get actual size of created file
-                local actual_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
-                
-                # Check for end of stream
-                if [[ $head_exit_code -ne 0 ]] || [[ $actual_size -eq 0 ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       End of stream detected (exit_code=$head_exit_code, size=$actual_size)"
-                    rm -f "$shard_file"
-                    break
-                elif [[ $actual_size -lt $dynamic_shard_size_bytes ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Final partial shard $shard_num created ($actual_size bytes)"
-                fi
-                
-                # Only upload if this shard is actually missing
-                if [[ -n "${missing_shard_map[$shard_num]:-}" ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Creating missing shard $shard_num..."
-                    # Upload this shard to all providers (synchronously for proper backpressure)
-                    upload_shard_to_all_providers "$shard_file" "$output_file" "$dataset_path" "$agekey" "$shard_num"
-                else
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Shard $shard_num exists on all providers - skipping"
-                    rm -f "$shard_file"
-                fi
-                
-                # Update for next iteration
-                current_byte_offset=$((current_byte_offset + actual_size))
-                shard_num=$((shard_num + 1))
-                processed_count=$((processed_count + 1))
-                
-                # Check for tiny final shard
-                local min_shard_threshold=$((dynamic_shard_size_bytes / 10))
-                if [[ $actual_size -lt $min_shard_threshold ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Tiny shard detected ($actual_size bytes < $min_shard_threshold threshold)"
-                    break
-                fi
-            done
-            
-            echo "$(date '+%Y-%m-%d %H:%M:%S')     Waiting for all parallel uploads to complete..."
-            wait
-            echo "$(date '+%Y-%m-%d %H:%M:%S')     All parallel uploads completed"
-        }
+            # The uploader function is responsible for checking if the shard exists and skipping if needed.
+            upload_shard_to_all_providers "$shard_file" "$output_file" "$dataset_path" "$agekey" "$shard_num"
+
+            current_byte_offset=$((current_byte_offset + bytes_read))
+            shard_num=$((shard_num + 1))
+
+            if [[ $bytes_read -lt $dynamic_shard_size_bytes ]]; then
+                break # Last shard was partial, so we are done.
+            fi
+        done
+        wait # Wait for any backgrounded uploads to finish
     }
-    
-    # Clean up temp directory
-    trap - EXIT
-    cleanup_temp_files
-    
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Parallel streaming backup complete"
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming backup process complete."
 }
 
 upload_shard_to_all_providers() {
@@ -838,266 +660,11 @@ upload_shard_to_provider() {
     echo "$(date '+%Y-%m-%d %H:%M:%S')         → Uploading shard $shard_num to $provider_name..."
     
     # Stream shard: compress -> encrypt -> progress -> upload
-    if gzip < "$shard_file" | age -r "$agekey" | pv -p -t -e -r -B 1M -N "$provider_name Shard $shard_num" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
+    if gzip < "$shard_file" | age -r "$agekey" | rclone --progress rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
         echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded shard $shard_num to $provider_name"
         return 0
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload shard $shard_num to $provider_name"
-        return 1
-    fi
-}
-
-stream_zfs_to_cloud() {
-    local prev_snap="$1"
-    local current_snap="$2"
-    local backup_prefix="$3"
-    local rclone_remote="$4"
-    local dataset_path="$5"
-    local agekey="$6"
-    local backup_type="$7"
-    
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting streaming backup ($backup_type)"
-    
-    # Check for existing shards (resumable backup support)
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Checking for existing shards..."
-    local existing_shards=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" | sort || true))
-    
-    if [[ ${#existing_shards[@]} -gt 0 ]]; then
-        # Check if backup is already complete
-        if is_backup_complete "$rclone_remote" "$dataset_path" "$backup_prefix"; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Backup already complete: detected completion pattern"
-            echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ All ${#existing_shards[@]} shards exist in cloud storage"
-            echo "$(date '+%Y-%m-%d %H:%M:%S')     Skipping backup - already complete"
-            return 0
-        else
-            echo "$(date '+%Y-%m-%d %H:%M:%S')     Found ${#existing_shards[@]} existing shards - resuming backup"
-            echo "$(date '+%Y-%m-%d %H:%M:%S')       Existing: ${existing_shards[0]} ... ${existing_shards[-1]}"
-        fi
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     No existing shards found - starting fresh backup"
-    fi
-    
-    # Create the zfs send command - always full
-    local zfs_cmd="zfs send \"$current_snap\""
-    
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Streaming: $zfs_cmd"
-    
-    # Estimate number of shards based on dataset size
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimating backup size..."
-    local dataset_size_bytes=0
-    local estimated_shards=0
-    
-    # Get dataset size for progress estimation (always full backup)
-    dataset_size_bytes=$(zfs get -H -o value -p used "${current_snap%@*}" 2>/dev/null || echo "1073741824")
-    
-    # Calculate dynamic shard size: 1% of dataset = exactly 100 shards
-    # This provides perfect progress tracking regardless of dataset size
-    local dynamic_shard_size_bytes=$((dataset_size_bytes / 100))
-    
-    # Set minimum shard size (10MB) and maximum shard size (5GB) for cloud provider limits
-    local min_shard_size=$((10 * 1024 * 1024))       # 10MB minimum
-    local max_shard_size=$((5 * 1024 * 1024 * 1024))  # 5GB maximum (Amazon S3 object limit)
-    
-    if [[ $dynamic_shard_size_bytes -lt $min_shard_size ]]; then
-        dynamic_shard_size_bytes=$min_shard_size
-        estimated_shards=$(((dataset_size_bytes + dynamic_shard_size_bytes - 1) / dynamic_shard_size_bytes))
-    elif [[ $dynamic_shard_size_bytes -gt $max_shard_size ]]; then
-        dynamic_shard_size_bytes=$max_shard_size
-        estimated_shards=$(((dataset_size_bytes + dynamic_shard_size_bytes - 1) / dynamic_shard_size_bytes))
-    else
-        estimated_shards=100  # Exactly 100 shards at 1% each
-    fi
-    
-    estimated_shards=$((estimated_shards > 0 ? estimated_shards : 1))  # Minimum 1 shard
-    
-    # Convert to human-readable shard size
-    local shard_size_human
-    if [[ $dynamic_shard_size_bytes -ge $((1024 * 1024 * 1024)) ]]; then
-        shard_size_human="$((dynamic_shard_size_bytes / 1024 / 1024 / 1024))G"
-    elif [[ $dynamic_shard_size_bytes -ge $((1024 * 1024)) ]]; then
-        shard_size_human="$((dynamic_shard_size_bytes / 1024 / 1024))M"
-    else
-        shard_size_human="$((dynamic_shard_size_bytes / 1024))K"
-    fi
-    
-    # Show size estimation
-    local size_mb=$((dataset_size_bytes / 1024 / 1024))
-    if [[ $size_mb -gt 1024 ]]; then
-        local size_gb=$((size_mb / 1024))
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: ${size_gb}GB (${estimated_shards} shards of ${shard_size_human} each)"
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Estimated size: ${size_mb}MB (${estimated_shards} shards of ${shard_size_human} each)"
-    fi
-    
-    # True streaming approach: process shards one at a time as split creates them
-    local temp_dir=$(mktemp -d)
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Temp directory: $temp_dir"
-    
-    # Cleanup function - but don't trap it yet (let split complete first)
-    cleanup_temp_files() {
-        rm -rf "$temp_dir" 2>/dev/null || true
-    }
-    
-    # True streaming approach with backpressure control
-    echo "$(date '+%Y-%m-%d %H:%M:%S')     Starting true streaming backup with backpressure..."
-    
-    # Calculate bytes to skip for resumable backup
-    local bytes_to_skip=0
-    if [[ ${#existing_shards[@]} -gt 0 ]]; then
-        bytes_to_skip=$((${#existing_shards[@]} * dynamic_shard_size_bytes))
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     Resuming: skipping $bytes_to_skip bytes (${#existing_shards[@]} existing shards)"
-        shard_num=$((${#existing_shards[@]} + 1))
-    fi
-    
-    # Create a custom streaming pipeline with controlled backpressure and progress tracking
-    {
-        eval "$zfs_cmd" | pv -s "$dataset_size_bytes" -p -t -e -r -B 1M -N "ZFS Stream" | {
-            # Calculate byte offset for resume (moved inside subshell to fix variable scoping)
-            local bytes_to_skip=0
-            local shard_num=1
-            local current_byte_offset=0
-            local processed_count=0
-            local upload_success=true
-            
-            if [[ ${#existing_shards[@]} -gt 0 ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S')     Calculating resume position from existing shards..."
-                
-                # Extract byte offsets from existing shard filenames and find the highest
-                local highest_offset=0
-                local highest_shard_num=0
-                
-                for shard in "${existing_shards[@]}"; do
-                    # Extract byte offset from filename: backup_prefix-s###-b##########.zfs.gz.age
-                    local offset=$(echo "$shard" | sed -E 's/.*-b([0-9]{10})\.zfs\.gz\.age$/\1/' | sed 's/^0*//')
-                    local shard_number=$(echo "$shard" | sed -E 's/.*-s([0-9]{3})-b[0-9]{10}\.zfs\.gz\.age$/\1/' | sed 's/^0*//')
-                    
-                    # Handle empty offset (if sed fails)
-                    [[ -z "$offset" ]] && offset=0
-                    [[ -z "$shard_number" ]] && shard_number=1
-                    
-                    if [[ $offset -gt $highest_offset ]]; then
-                        highest_offset=$offset
-                        highest_shard_num=$shard_number
-                    fi
-                done
-                
-                # For now, estimate the last shard size as dynamic_shard_size_bytes
-                # TODO: This is still an approximation - ideally we'd track actual raw bytes
-                # But since ZFS streams are deterministic, this should work for most cases
-                local estimated_last_shard_size=$dynamic_shard_size_bytes
-                
-                # Resume from the next position after the highest shard
-                bytes_to_skip=$((highest_offset + estimated_last_shard_size))
-                shard_num=$((highest_shard_num + 1))
-                
-                echo "$(date '+%Y-%m-%d %H:%M:%S')     Resuming from byte offset: $bytes_to_skip (shard $shard_num)"
-            fi
-            
-            # Skip bytes for resuming
-            if [[ $bytes_to_skip -gt 0 ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S')     Skipping $bytes_to_skip bytes to resume from shard $shard_num"
-                # Use reliable block size for skipping
-                local skip_block_size=65536  # 64KB blocks
-                local skip_count=$((bytes_to_skip / skip_block_size))
-                local skip_remaining=$((bytes_to_skip % skip_block_size))
-                
-                
-                if [[ $skip_count -gt 0 ]]; then
-                    dd bs="$skip_block_size" count="$skip_count" iflag=fullblock of=/dev/null 2>/dev/null
-                fi
-                if [[ $skip_remaining -gt 0 ]]; then
-                    dd bs=1 count="$skip_remaining" iflag=fullblock of=/dev/null 2>/dev/null
-                fi
-                current_byte_offset=$bytes_to_skip
-            fi
-            
-            while true; do
-                
-                local shard_file="$temp_dir/shard-$(printf "%03d" "$shard_num")"
-                local output_file="${backup_prefix}-s$(printf "%03d" "$shard_num")-b$(printf "%010d" "$current_byte_offset").zfs.gz.age"
-                
-                echo "$(date '+%Y-%m-%d %H:%M:%S')       Creating shard $shard_num..."
-                
-                
-                # Read exactly one shard worth of data (with backpressure)
-                # head -c is simpler and more reliable than dd for exact byte counts
-                local head_result
-                head_result=$(head -c "$dynamic_shard_size_bytes" > "$shard_file" 2>&1)
-                local head_exit_code=$?
-                
-                
-                # Get actual size of created file
-                local actual_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
-                
-                # Check if shard file was actually created
-                if [[ ! -f "$shard_file" ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       ERROR: Shard file was not created: $shard_file"
-                    break
-                fi
-                
-                if [[ $head_exit_code -ne 0 ]] || [[ $actual_size -eq 0 ]]; then
-                    # End of stream or error
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       End of stream detected (exit_code=$head_exit_code, size=$actual_size)"
-                    rm -f "$shard_file"
-                    break
-                elif [[ $actual_size -lt $dynamic_shard_size_bytes ]]; then
-                    # Partial shard exists, process it as final shard
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Final partial shard $shard_num created ($actual_size bytes)"
-                fi
-                
-                # Check if this shard already exists in cloud (resumable backup)
-                if printf '%s\n' "${existing_shards[@]}" | grep -q "^${output_file}$"; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       ✓ Shard $shard_num already exists: $output_file"
-                else
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Processing shard $shard_num..."
-                    
-                    # Get shard file size
-                    local shard_size=$(stat -c%s "$shard_file" 2>/dev/null || echo "0")
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')         Uploading $(numfmt --to=iec $shard_size)..."
-                    
-                    # Stream shard: compress -> encrypt -> progress -> upload
-                    if gzip < "$shard_file" | age -r "$agekey" | pv -p -t -e -r -B 1M -N "Shard $shard_num" | rclone rcat "${rclone_remote}/${dataset_path}/${output_file}"; then
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')         ✓ Uploaded $output_file"
-                    else
-                        echo "$(date '+%Y-%m-%d %H:%M:%S')         ✗ Failed to upload $output_file"
-                        rm -f "$shard_file"
-                        exit 1
-                    fi
-                fi
-                
-                # Clean up temp file immediately after processing (true streaming!)
-                rm -f "$shard_file"
-                processed_count=$((processed_count + 1))
-                
-                # Update byte offset and shard number for next iteration
-                current_byte_offset=$((current_byte_offset + actual_size))
-                shard_num=$((shard_num + 1))
-                
-                # Only break if this is a significantly small shard (< 10% of expected)
-                # A shard that's 80-90% of expected size is still valid data
-                local min_shard_threshold=$((dynamic_shard_size_bytes / 10))  # 10% of expected
-                if [[ $actual_size -lt $min_shard_threshold ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Tiny shard detected ($actual_size bytes < $min_shard_threshold threshold)"
-                    break
-                elif [[ $actual_size -lt $dynamic_shard_size_bytes ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S')       Partial shard but continuing ($actual_size of $dynamic_shard_size_bytes expected)"
-                fi
-            done
-            
-        }
-    }
-    
-    # Clean up temp directory only after everything is done
-    trap - EXIT  # Remove trap first
-    cleanup_temp_files
-    
-    # Check the exit code from the streaming pipeline
-    local pipeline_exit_code=$?
-    if [[ $pipeline_exit_code -eq 0 ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✓ Streaming backup complete"
-        return 0
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S')     ✗ Backup failed (pipeline exit code: $pipeline_exit_code)"
         return 1
     fi
 }
@@ -1168,7 +735,7 @@ run_restore() {
             # Try providers in order of preference
             for prov in backblaze scaleway $(printf '%s\n' "${!PROVIDERS[@]}" | grep -v -E '^(backblaze|scaleway)$' | sort); do
                 local remote="${PROVIDERS[$prov]}"
-                if rclone lsf "${remote}/${dataset_path}/" 2>/dev/null | grep -q "^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$"; then
+                if rclone lsf "${remote}/${dataset_path}/" 2>/dev/null | grep -q "^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$"; then
                     selected_remote="$remote"
                     provider_name="${PROVIDER_NAMES[$prov]} - auto-selected"
                     echo "Found backups on $prov"
@@ -1216,7 +783,7 @@ run_restore() {
         echo "Discovering available backups..."
         
         # Get all backup prefixes for this dataset (new byte offset format)
-        local all_backups=($(rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || true))
+        local all_backups=($(rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age
         
         if [[ ${#all_backups[@]} -eq 0 ]]; then
             echo "ERROR: No backups found for dataset $source_dataset"
@@ -1241,7 +808,7 @@ run_restore() {
         echo "Searching for backup matching: $backup_prefix"
         
         # Get all backup prefixes for this dataset (new byte offset format)
-        local all_backups=($(rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || true))
+        local all_backups=($(rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age
         
         if [[ ${#all_backups[@]} -eq 0 ]]; then
             echo "ERROR: No backups found for dataset $source_dataset"
@@ -1403,7 +970,1637 @@ run_restore() {
     # Sort shards by byte offset to ensure correct order
     local sorted_shards=()
     for shard_file in "${shard_files[@]}"; do
-        local offset=$(echo "$shard_file" | sed 's/.*-s[0-9][0-9][0-9]-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
+        local offset=$(echo "$shard_file" | sed 's/.*-s[0-9][0-9][0-9]-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
+        sorted_shards+=("$offset:$shard_file")
+    done
+    
+    # Sort by byte offset (numeric sort on the offset part)
+    IFS=$'\n' sorted_shards=($(sort -t: -k1,1n <<< "${sorted_shards[*]}"))
+    
+    echo "  Streaming ${#sorted_shards[@]} shards with individual progress bars..."
+    echo ""
+    
+    local total_shards=${#sorted_shards[@]}
+    
+    # Stream shards directly to ZFS receive - proven working approach
+    {
+        for entry in "${sorted_shards[@]}"; do
+            local shard_file="${entry#*:}"
+            echo "    Processing: $shard_file" >&2
+            
+            # Stream: download → decrypt → decompress
+            rclone cat "${remote_path}/${shard_file}" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip
+        done
+    } | zfs recv -F "$target_dataset"
+    
+    local zfs_recv_result=$?
+    
+    if [[ $zfs_recv_result -eq 0 ]]; then
+        echo "  ✓ ZFS receive completed successfully"
+    else
+        echo "  ✗ ZFS receive failed with exit code: $zfs_recv_result"
+        return $zfs_recv_result
+    fi
+    
+    # Cleanup
+    cd /
+    rm -rf "$work_dir"
+    
+    echo ""
+    echo "✅ Restore complete!"
+    echo ""
+    echo "Source: $source_dataset ($backup_prefix)"
+    echo "Target: $target_dataset"
+    echo "Shards processed: ${#shard_files[@]}"
+    echo "Provider: $provider_name"
+    echo ""
+    echo "You can now:"
+    echo "  - Mount: zfs mount $target_dataset"
+    echo "  - List snapshots: zfs list -t snapshot -r $target_dataset"
+    echo "  - Access data at: $(zfs get -H -o value mountpoint $target_dataset 2>/dev/null || echo 'mount point')"
+}
+
+# === END RESTORE FUNCTIONS ===
+
+# === LIST FUNCTIONS ===
+
+run_list() {
+    local dataset_arg="$1"
+    local provider="${2:-all}"
+    
+    echo "=== Offsite Backup List ==="
+    echo ""
+    
+    # Provider selection (same logic as backup)
+    if [[ "$provider" == "all" ]]; then
+        SELECTED_PROVIDERS=($(printf '%s\n' "${!PROVIDERS[@]}" | sort))
+    else
+        case "$provider" in
+            bb) provider="backblaze" ;;
+            scw) provider="scaleway" ;;
+        esac
+        
+        if [[ -z "${PROVIDERS[$provider]:-}" ]]; then
+            echo "ERROR: Unknown provider '$provider'"
+            echo "Available providers: ${\!PROVIDERS[*]}"
+            exit 1
+        fi
+        
+        SELECTED_PROVIDERS=("$provider")
+    fi
+    
+    # List backups for each provider
+    for prov in "${SELECTED_PROVIDERS[@]}"; do
+        rclone_remote="${PROVIDERS[$prov]}"
+        provider_name="${PROVIDER_NAMES[$prov]}"
+        
+        echo "📡 $provider_name ($prov)"
+        echo "─────────────────────────────────────"
+        
+        if [[ -n "$dataset_arg" ]]; then
+            # List specific dataset
+            list_dataset_backups "$rclone_remote" "$dataset_arg"
+        else
+            # List all datasets
+            list_all_backups "$rclone_remote"
+        fi
+        
+        echo ""
+    done
+}
+
+list_dataset_backups() {
+    local rclone_remote="$1"
+    local dataset="$2"
+    local dataset_path="${dataset//\//_}"
+    
+    # Get all backup prefixes for this dataset (new byte offset format)
+    local backup_files=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep -E "^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$" | sort || true))
+    
+    if [[ ${#backup_files[@]} -eq 0 ]]; then
+        echo "  No backups found for $dataset"
+        return
+    fi
+    
+    # Extract unique backup prefixes (remove shard suffix from new format)
+    local backup_prefixes=($(printf '%s\n' "${backup_files[@]}" | sed -E 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u))
+    
+    echo "  Dataset: $dataset"
+    echo ""
+    
+    for prefix in "${backup_prefixes[@]}"; do
+        # Count shards for this backup (new byte offset format)
+        local shard_count=$(printf '%s\n' "${backup_files[@]}" | grep "^${prefix}-s[0-9][0-9][0-9]-b" | wc -l)
+        
+        # Check if backup is complete (simplified for now)
+        local status="❌ Incomplete" 
+        # TODO: Re-enable completion check when function scope issue is resolved
+        # if is_backup_complete "$rclone_remote" "$dataset_path" "$prefix"; then
+        #     status="✅ Complete"
+        # fi
+        
+        # Display backup info (new format is dataset:snapshot)
+        echo "    $status $prefix ($shard_count shards)"
+    done
+}
+
+list_all_backups() {
+    local rclone_remote="$1"
+    
+    # Get all dataset directories
+    local datasets=($(rclone lsd "${rclone_remote}/" 2>/dev/null | awk '{print $NF}' | grep -v "^$" || true))
+    
+    if [[ ${#datasets[@]} -eq 0 ]]; then
+        echo "  No backups found"
+        return
+    fi
+    
+    for dataset_path in "${datasets[@]}"; do
+        # Convert path back to dataset name
+        local dataset="${dataset_path//_//}"
+        list_dataset_backups "$rclone_remote" "$dataset"
+        echo ""
+    done
+}
+
+# === END LIST FUNCTIONS ===
+ | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || true))
+        
+        if [[ ${#all_backups[@]} -eq 0 ]]; then
+            echo "ERROR: No backups found for dataset $source_dataset"
+            exit 1
+        fi
+        
+        if [[ "$backup_prefix" == "latest-full" ]]; then
+            # In new format, all backups are "full" - just get the latest
+            backup_prefix="${all_backups[-1]}"
+            echo "Selected latest backup: $backup_prefix"
+        else
+            # Find latest backup
+            backup_prefix="${all_backups[-1]}"
+            echo "Selected latest backup: $backup_prefix"
+        fi
+        
+        echo "Available backups for $source_dataset:"
+        printf '%s\n' "${all_backups[@]}" | tail -5
+        echo ""
+    else
+        # User specified a specific backup - need to find the actual backup prefix
+        echo "Searching for backup matching: $backup_prefix"
+        
+        # Get all backup prefixes for this dataset (new byte offset format)
+        local all_backups=($(rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age
+        
+        if [[ ${#all_backups[@]} -eq 0 ]]; then
+            echo "ERROR: No backups found for dataset $source_dataset"
+            exit 1
+        fi
+        
+        # Look for backup that matches the specified snapshot name
+        local found_backup=""
+        for backup in "${all_backups[@]}"; do
+            if [[ "$backup" == "${source_dataset//\//_}:${backup_prefix}" ]]; then
+                found_backup="$backup"
+                break
+            fi
+        done
+        
+        if [[ -z "$found_backup" ]]; then
+            echo "ERROR: No backup found matching snapshot: $backup_prefix"
+            echo "Available backups:"
+            printf '%s\n' "${all_backups[@]}"
+            exit 1
+        fi
+        
+        backup_prefix="$found_backup"
+        echo "Found matching backup: $backup_prefix"
+    fi
+    
+    echo "Final backup selection: $backup_prefix"
+    echo ""
+    
+    # Discover shards
+    echo "Discovering backup shards..."
+    local shard_files=($(rclone lsf "${remote_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" | sort))
+    
+    if [[ ${#shard_files[@]} -eq 0 ]]; then
+        echo "ERROR: No shards found for backup prefix: ${backup_prefix}"
+        echo ""
+        echo "Available backups for ${source_dataset}:"
+        rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || echo "No backups found"
+        exit 1
+    fi
+    
+    echo "Found ${#shard_files[@]} shards: ${shard_files[0]} ... ${shard_files[-1]}"
+    
+    # Connection test
+    echo "Testing connection to $provider_name..."
+    if ! rclone lsd "${selected_remote%:*}:" >/dev/null 2>&1; then
+        echo "ERROR: Cannot connect to $provider_name"
+        exit 1
+    fi
+    echo "✓ Connected to $provider_name"
+    
+    # Target dataset validation
+    if zfs list "$target_dataset" >/dev/null 2>&1; then
+        # Check if it's a pool or dataset
+        local target_type=$(zfs get -H -o value type "$target_dataset" 2>/dev/null)
+        
+        if [[ "$target_type" == "filesystem" ]]; then
+            echo "WARNING: Target dataset $target_dataset already exists"
+            
+            # Check if running in background (no TTY)
+            if [[ ! -t 0 ]]; then
+                echo "ERROR: Cannot prompt for confirmation when running in background"
+                echo "Target dataset already exists. Use --as to specify a different target name"
+                exit 1
+            fi
+            
+            read -p "Do you want to destroy and recreate it? (y/N): " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                echo "Restore cancelled"
+                echo "Suggestion: Use --as to specify a different target name"
+                exit 1
+            fi
+            echo "Destroying existing dataset..."
+            zfs destroy -r "$target_dataset"
+        else
+            echo "ERROR: Target $target_dataset exists but is not a filesystem"
+            echo "Type: $target_type"
+            echo "Use --as to specify a different target name"
+            exit 1
+        fi
+    else
+        # Check if parent exists for dataset creation
+        local parent_dataset=$(dirname "$target_dataset" | sed 's|/.*||' | head -1)
+        local dataset_path=$(echo "$target_dataset" | sed 's|^[^/]*/||')
+        
+        # If target contains '/', check parent exists
+        if [[ "$target_dataset" =~ / ]]; then
+            local parent_path=$(echo "$target_dataset" | sed 's|/[^/]*$||')
+            if ! zfs list "$parent_path" >/dev/null 2>&1; then
+                echo "ERROR: Parent dataset $parent_path does not exist"
+                echo "Create parent first or use --as with an existing parent"
+                exit 1
+            fi
+        fi
+    fi
+    
+    # Restore process
+    local work_dir="${TEMP_DIR}/offsite-restore-$(date +%s)"
+    mkdir -p "$work_dir"
+    cd "$work_dir"
+    
+    echo ""
+    echo "Starting restore process..."
+    echo "Working directory: $work_dir"
+    
+    # Ensure target dataset mountpoint exists
+    echo "Preparing target dataset: $target_dataset"
+    
+    # Get the expected mountpoint for the target dataset
+    local mountpoint
+    if zfs list -H -o mountpoint "$target_dataset" 2>/dev/null; then
+        # Dataset exists, get its mountpoint
+        mountpoint=$(zfs list -H -o mountpoint "$target_dataset" 2>/dev/null)
+        echo "  Target dataset already exists with mountpoint: $mountpoint"
+    else
+        # Dataset doesn't exist, predict the mountpoint
+        # ZFS typically inherits from parent or uses /<pool>/<dataset>
+        local pool_name="${target_dataset%%/*}"
+        local dataset_path="${target_dataset#*/}"
+        
+        # Check if pool exists and get its mountpoint
+        if zfs list -H -o mountpoint "$pool_name" 2>/dev/null; then
+            local pool_mountpoint=$(zfs list -H -o mountpoint "$pool_name" 2>/dev/null)
+            if [[ "$pool_mountpoint" == "none" ]] || [[ "$pool_mountpoint" == "-" ]]; then
+                # Pool has no mountpoint, use standard ZFS path
+                mountpoint="/$target_dataset"
+            else
+                # Pool has mountpoint, build path from it
+                if [[ -n "$dataset_path" ]]; then
+                    mountpoint="$pool_mountpoint/$dataset_path"
+                else
+                    mountpoint="$pool_mountpoint"
+                fi
+            fi
+        else
+            echo "ERROR: ZFS pool '$pool_name' not found"
+            exit 1
+        fi
+        
+        echo "  Target dataset will be created with mountpoint: $mountpoint"
+    fi
+    
+    # Create mountpoint directory if it doesn't exist
+    if [[ "$mountpoint" != "none" ]] && [[ "$mountpoint" != "-" ]] && [[ ! -d "$mountpoint" ]]; then
+        echo "  Creating mountpoint directory: $mountpoint"
+        if sudo mkdir -p "$mountpoint"; then
+            echo "  ✓ Mountpoint created successfully"
+        else
+            echo "  ✗ Failed to create mountpoint directory"
+            exit 1
+        fi
+    fi
+    
+    # Stream to ZFS receive with individual progress bars and pipeline buffer
+    echo "Step 1: Streaming ${#shard_files[@]} shards to ZFS receive..."
+    echo ""
+    
+    # Sort shards by byte offset to ensure correct order
+    local sorted_shards=()
+    for shard_file in "${shard_files[@]}"; do
+        local offset=$(echo "$shard_file" | sed 's/.*-s[0-9][0-9][0-9]-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
+        sorted_shards+=("$offset:$shard_file")
+    done
+    
+    # Sort by byte offset (numeric sort on the offset part)
+    IFS=$'\n' sorted_shards=($(sort -t: -k1,1n <<< "${sorted_shards[*]}"))
+    
+    echo "  Streaming ${#sorted_shards[@]} shards with individual progress bars..."
+    echo ""
+    
+    local total_shards=${#sorted_shards[@]}
+    
+    # Stream shards directly to ZFS receive - proven working approach
+    {
+        for entry in "${sorted_shards[@]}"; do
+            local shard_file="${entry#*:}"
+            echo "    Processing: $shard_file" >&2
+            
+            # Stream: download → decrypt → decompress
+            rclone cat "${remote_path}/${shard_file}" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip
+        done
+    } | zfs recv -F "$target_dataset"
+    
+    local zfs_recv_result=$?
+    
+    if [[ $zfs_recv_result -eq 0 ]]; then
+        echo "  ✓ ZFS receive completed successfully"
+    else
+        echo "  ✗ ZFS receive failed with exit code: $zfs_recv_result"
+        return $zfs_recv_result
+    fi
+    
+    # Cleanup
+    cd /
+    rm -rf "$work_dir"
+    
+    echo ""
+    echo "✅ Restore complete!"
+    echo ""
+    echo "Source: $source_dataset ($backup_prefix)"
+    echo "Target: $target_dataset"
+    echo "Shards processed: ${#shard_files[@]}"
+    echo "Provider: $provider_name"
+    echo ""
+    echo "You can now:"
+    echo "  - Mount: zfs mount $target_dataset"
+    echo "  - List snapshots: zfs list -t snapshot -r $target_dataset"
+    echo "  - Access data at: $(zfs get -H -o value mountpoint $target_dataset 2>/dev/null || echo 'mount point')"
+}
+
+# === END RESTORE FUNCTIONS ===
+
+# === LIST FUNCTIONS ===
+
+run_list() {
+    local dataset_arg="$1"
+    local provider="${2:-all}"
+    
+    echo "=== Offsite Backup List ==="
+    echo ""
+    
+    # Provider selection (same logic as backup)
+    if [[ "$provider" == "all" ]]; then
+        SELECTED_PROVIDERS=($(printf '%s\n' "${!PROVIDERS[@]}" | sort))
+    else
+        case "$provider" in
+            bb) provider="backblaze" ;;
+            scw) provider="scaleway" ;;
+        esac
+        
+        if [[ -z "${PROVIDERS[$provider]:-}" ]]; then
+            echo "ERROR: Unknown provider '$provider'"
+            echo "Available providers: ${\!PROVIDERS[*]}"
+            exit 1
+        fi
+        
+        SELECTED_PROVIDERS=("$provider")
+    fi
+    
+    # List backups for each provider
+    for prov in "${SELECTED_PROVIDERS[@]}"; do
+        rclone_remote="${PROVIDERS[$prov]}"
+        provider_name="${PROVIDER_NAMES[$prov]}"
+        
+        echo "📡 $provider_name ($prov)"
+        echo "─────────────────────────────────────"
+        
+        if [[ -n "$dataset_arg" ]]; then
+            # List specific dataset
+            list_dataset_backups "$rclone_remote" "$dataset_arg"
+        else
+            # List all datasets
+            list_all_backups "$rclone_remote"
+        fi
+        
+        echo ""
+    done
+}
+
+list_dataset_backups() {
+    local rclone_remote="$1"
+    local dataset="$2"
+    local dataset_path="${dataset//\//_}"
+    
+    # Get all backup prefixes for this dataset (new byte offset format)
+    local backup_files=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep -E "^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$" | sort || true))
+    
+    if [[ ${#backup_files[@]} -eq 0 ]]; then
+        echo "  No backups found for $dataset"
+        return
+    fi
+    
+    # Extract unique backup prefixes (remove shard suffix from new format)
+    local backup_prefixes=($(printf '%s\n' "${backup_files[@]}" | sed -E 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u))
+    
+    echo "  Dataset: $dataset"
+    echo ""
+    
+    for prefix in "${backup_prefixes[@]}"; do
+        # Count shards for this backup (new byte offset format)
+        local shard_count=$(printf '%s\n' "${backup_files[@]}" | grep "^${prefix}-s[0-9][0-9][0-9]-b" | wc -l)
+        
+        # Check if backup is complete (simplified for now)
+        local status="❌ Incomplete" 
+        # TODO: Re-enable completion check when function scope issue is resolved
+        # if is_backup_complete "$rclone_remote" "$dataset_path" "$prefix"; then
+        #     status="✅ Complete"
+        # fi
+        
+        # Display backup info (new format is dataset:snapshot)
+        echo "    $status $prefix ($shard_count shards)"
+    done
+}
+
+list_all_backups() {
+    local rclone_remote="$1"
+    
+    # Get all dataset directories
+    local datasets=($(rclone lsd "${rclone_remote}/" 2>/dev/null | awk '{print $NF}' | grep -v "^$" || true))
+    
+    if [[ ${#datasets[@]} -eq 0 ]]; then
+        echo "  No backups found"
+        return
+    fi
+    
+    for dataset_path in "${datasets[@]}"; do
+        # Convert path back to dataset name
+        local dataset="${dataset_path//_//}"
+        list_dataset_backups "$rclone_remote" "$dataset"
+        echo ""
+    done
+}
+
+# === END LIST FUNCTIONS ===
+ | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || true))
+        
+        if [[ ${#all_backups[@]} -eq 0 ]]; then
+            echo "ERROR: No backups found for dataset $source_dataset"
+            exit 1
+        fi
+        
+        # Look for backup that matches the specified snapshot name
+        local found_backup=""
+        for backup in "${all_backups[@]}"; do
+            if [[ "$backup" == "${source_dataset//\//_}:${backup_prefix}" ]]; then
+                found_backup="$backup"
+                break
+            fi
+        done
+        
+        if [[ -z "$found_backup" ]]; then
+            echo "ERROR: No backup found matching snapshot: $backup_prefix"
+            echo "Available backups:"
+            printf '%s\n' "${all_backups[@]}"
+            exit 1
+        fi
+        
+        backup_prefix="$found_backup"
+        echo "Found matching backup: $backup_prefix"
+    fi
+    
+    echo "Final backup selection: $backup_prefix"
+    echo ""
+    
+    # Discover shards
+    echo "Discovering backup shards..."
+    local shard_files=($(rclone lsf "${remote_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" | sort))
+    
+    if [[ ${#shard_files[@]} -eq 0 ]]; then
+        echo "ERROR: No shards found for backup prefix: ${backup_prefix}"
+        echo ""
+        echo "Available backups for ${source_dataset}:"
+        rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || echo "No backups found"
+        exit 1
+    fi
+    
+    echo "Found ${#shard_files[@]} shards: ${shard_files[0]} ... ${shard_files[-1]}"
+    
+    # Connection test
+    echo "Testing connection to $provider_name..."
+    if ! rclone lsd "${selected_remote%:*}:" >/dev/null 2>&1; then
+        echo "ERROR: Cannot connect to $provider_name"
+        exit 1
+    fi
+    echo "✓ Connected to $provider_name"
+    
+    # Target dataset validation
+    if zfs list "$target_dataset" >/dev/null 2>&1; then
+        # Check if it's a pool or dataset
+        local target_type=$(zfs get -H -o value type "$target_dataset" 2>/dev/null)
+        
+        if [[ "$target_type" == "filesystem" ]]; then
+            echo "WARNING: Target dataset $target_dataset already exists"
+            
+            # Check if running in background (no TTY)
+            if [[ ! -t 0 ]]; then
+                echo "ERROR: Cannot prompt for confirmation when running in background"
+                echo "Target dataset already exists. Use --as to specify a different target name"
+                exit 1
+            fi
+            
+            read -p "Do you want to destroy and recreate it? (y/N): " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                echo "Restore cancelled"
+                echo "Suggestion: Use --as to specify a different target name"
+                exit 1
+            fi
+            echo "Destroying existing dataset..."
+            zfs destroy -r "$target_dataset"
+        else
+            echo "ERROR: Target $target_dataset exists but is not a filesystem"
+            echo "Type: $target_type"
+            echo "Use --as to specify a different target name"
+            exit 1
+        fi
+    else
+        # Check if parent exists for dataset creation
+        local parent_dataset=$(dirname "$target_dataset" | sed 's|/.*||' | head -1)
+        local dataset_path=$(echo "$target_dataset" | sed 's|^[^/]*/||')
+        
+        # If target contains '/', check parent exists
+        if [[ "$target_dataset" =~ / ]]; then
+            local parent_path=$(echo "$target_dataset" | sed 's|/[^/]*$||')
+            if ! zfs list "$parent_path" >/dev/null 2>&1; then
+                echo "ERROR: Parent dataset $parent_path does not exist"
+                echo "Create parent first or use --as with an existing parent"
+                exit 1
+            fi
+        fi
+    fi
+    
+    # Restore process
+    local work_dir="${TEMP_DIR}/offsite-restore-$(date +%s)"
+    mkdir -p "$work_dir"
+    cd "$work_dir"
+    
+    echo ""
+    echo "Starting restore process..."
+    echo "Working directory: $work_dir"
+    
+    # Ensure target dataset mountpoint exists
+    echo "Preparing target dataset: $target_dataset"
+    
+    # Get the expected mountpoint for the target dataset
+    local mountpoint
+    if zfs list -H -o mountpoint "$target_dataset" 2>/dev/null; then
+        # Dataset exists, get its mountpoint
+        mountpoint=$(zfs list -H -o mountpoint "$target_dataset" 2>/dev/null)
+        echo "  Target dataset already exists with mountpoint: $mountpoint"
+    else
+        # Dataset doesn't exist, predict the mountpoint
+        # ZFS typically inherits from parent or uses /<pool>/<dataset>
+        local pool_name="${target_dataset%%/*}"
+        local dataset_path="${target_dataset#*/}"
+        
+        # Check if pool exists and get its mountpoint
+        if zfs list -H -o mountpoint "$pool_name" 2>/dev/null; then
+            local pool_mountpoint=$(zfs list -H -o mountpoint "$pool_name" 2>/dev/null)
+            if [[ "$pool_mountpoint" == "none" ]] || [[ "$pool_mountpoint" == "-" ]]; then
+                # Pool has no mountpoint, use standard ZFS path
+                mountpoint="/$target_dataset"
+            else
+                # Pool has mountpoint, build path from it
+                if [[ -n "$dataset_path" ]]; then
+                    mountpoint="$pool_mountpoint/$dataset_path"
+                else
+                    mountpoint="$pool_mountpoint"
+                fi
+            fi
+        else
+            echo "ERROR: ZFS pool '$pool_name' not found"
+            exit 1
+        fi
+        
+        echo "  Target dataset will be created with mountpoint: $mountpoint"
+    fi
+    
+    # Create mountpoint directory if it doesn't exist
+    if [[ "$mountpoint" != "none" ]] && [[ "$mountpoint" != "-" ]] && [[ ! -d "$mountpoint" ]]; then
+        echo "  Creating mountpoint directory: $mountpoint"
+        if sudo mkdir -p "$mountpoint"; then
+            echo "  ✓ Mountpoint created successfully"
+        else
+            echo "  ✗ Failed to create mountpoint directory"
+            exit 1
+        fi
+    fi
+    
+    # Stream to ZFS receive with individual progress bars and pipeline buffer
+    echo "Step 1: Streaming ${#shard_files[@]} shards to ZFS receive..."
+    echo ""
+    
+    # Sort shards by byte offset to ensure correct order
+    local sorted_shards=()
+    for shard_file in "${shard_files[@]}"; do
+        local offset=$(echo "$shard_file" | sed 's/.*-s[0-9][0-9][0-9]-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
+        sorted_shards+=("$offset:$shard_file")
+    done
+    
+    # Sort by byte offset (numeric sort on the offset part)
+    IFS=$'\n' sorted_shards=($(sort -t: -k1,1n <<< "${sorted_shards[*]}"))
+    
+    echo "  Streaming ${#sorted_shards[@]} shards with individual progress bars..."
+    echo ""
+    
+    local total_shards=${#sorted_shards[@]}
+    
+    # Stream shards directly to ZFS receive - proven working approach
+    {
+        for entry in "${sorted_shards[@]}"; do
+            local shard_file="${entry#*:}"
+            echo "    Processing: $shard_file" >&2
+            
+            # Stream: download → decrypt → decompress
+            rclone cat "${remote_path}/${shard_file}" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip
+        done
+    } | zfs recv -F "$target_dataset"
+    
+    local zfs_recv_result=$?
+    
+    if [[ $zfs_recv_result -eq 0 ]]; then
+        echo "  ✓ ZFS receive completed successfully"
+    else
+        echo "  ✗ ZFS receive failed with exit code: $zfs_recv_result"
+        return $zfs_recv_result
+    fi
+    
+    # Cleanup
+    cd /
+    rm -rf "$work_dir"
+    
+    echo ""
+    echo "✅ Restore complete!"
+    echo ""
+    echo "Source: $source_dataset ($backup_prefix)"
+    echo "Target: $target_dataset"
+    echo "Shards processed: ${#shard_files[@]}"
+    echo "Provider: $provider_name"
+    echo ""
+    echo "You can now:"
+    echo "  - Mount: zfs mount $target_dataset"
+    echo "  - List snapshots: zfs list -t snapshot -r $target_dataset"
+    echo "  - Access data at: $(zfs get -H -o value mountpoint $target_dataset 2>/dev/null || echo 'mount point')"
+}
+
+# === END RESTORE FUNCTIONS ===
+
+# === LIST FUNCTIONS ===
+
+run_list() {
+    local dataset_arg="$1"
+    local provider="${2:-all}"
+    
+    echo "=== Offsite Backup List ==="
+    echo ""
+    
+    # Provider selection (same logic as backup)
+    if [[ "$provider" == "all" ]]; then
+        SELECTED_PROVIDERS=($(printf '%s\n' "${!PROVIDERS[@]}" | sort))
+    else
+        case "$provider" in
+            bb) provider="backblaze" ;;
+            scw) provider="scaleway" ;;
+        esac
+        
+        if [[ -z "${PROVIDERS[$provider]:-}" ]]; then
+            echo "ERROR: Unknown provider '$provider'"
+            echo "Available providers: ${\!PROVIDERS[*]}"
+            exit 1
+        fi
+        
+        SELECTED_PROVIDERS=("$provider")
+    fi
+    
+    # List backups for each provider
+    for prov in "${SELECTED_PROVIDERS[@]}"; do
+        rclone_remote="${PROVIDERS[$prov]}"
+        provider_name="${PROVIDER_NAMES[$prov]}"
+        
+        echo "📡 $provider_name ($prov)"
+        echo "─────────────────────────────────────"
+        
+        if [[ -n "$dataset_arg" ]]; then
+            # List specific dataset
+            list_dataset_backups "$rclone_remote" "$dataset_arg"
+        else
+            # List all datasets
+            list_all_backups "$rclone_remote"
+        fi
+        
+        echo ""
+    done
+}
+
+list_dataset_backups() {
+    local rclone_remote="$1"
+    local dataset="$2"
+    local dataset_path="${dataset//\//_}"
+    
+    # Get all backup prefixes for this dataset (new byte offset format)
+    local backup_files=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep -E "^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$" | sort || true))
+    
+    if [[ ${#backup_files[@]} -eq 0 ]]; then
+        echo "  No backups found for $dataset"
+        return
+    fi
+    
+    # Extract unique backup prefixes (remove shard suffix from new format)
+    local backup_prefixes=($(printf '%s\n' "${backup_files[@]}" | sed -E 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u))
+    
+    echo "  Dataset: $dataset"
+    echo ""
+    
+    for prefix in "${backup_prefixes[@]}"; do
+        # Count shards for this backup (new byte offset format)
+        local shard_count=$(printf '%s\n' "${backup_files[@]}" | grep "^${prefix}-s[0-9][0-9][0-9]-b" | wc -l)
+        
+        # Check if backup is complete (simplified for now)
+        local status="❌ Incomplete" 
+        # TODO: Re-enable completion check when function scope issue is resolved
+        # if is_backup_complete "$rclone_remote" "$dataset_path" "$prefix"; then
+        #     status="✅ Complete"
+        # fi
+        
+        # Display backup info (new format is dataset:snapshot)
+        echo "    $status $prefix ($shard_count shards)"
+    done
+}
+
+list_all_backups() {
+    local rclone_remote="$1"
+    
+    # Get all dataset directories
+    local datasets=($(rclone lsd "${rclone_remote}/" 2>/dev/null | awk '{print $NF}' | grep -v "^$" || true))
+    
+    if [[ ${#datasets[@]} -eq 0 ]]; then
+        echo "  No backups found"
+        return
+    fi
+    
+    for dataset_path in "${datasets[@]}"; do
+        # Convert path back to dataset name
+        local dataset="${dataset_path//_//}"
+        list_dataset_backups "$rclone_remote" "$dataset"
+        echo ""
+    done
+}
+
+# === END LIST FUNCTIONS ===
+ | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || true))
+        
+        if [[ ${#all_backups[@]} -eq 0 ]]; then
+            echo "ERROR: No backups found for dataset $source_dataset"
+            exit 1
+        fi
+        
+        # Look for backup that matches the specified snapshot name
+        local found_backup=""
+        for backup in "${all_backups[@]}"; do
+            if [[ "$backup" == "${source_dataset//\//_}:${backup_prefix}" ]]; then
+                found_backup="$backup"
+                break
+            fi
+        done
+        
+        if [[ -z "$found_backup" ]]; then
+            echo "ERROR: No backup found matching snapshot: $backup_prefix"
+            echo "Available backups:"
+            printf '%s\n' "${all_backups[@]}"
+            exit 1
+        fi
+        
+        backup_prefix="$found_backup"
+        echo "Found matching backup: $backup_prefix"
+    fi
+    
+    echo "Final backup selection: $backup_prefix"
+    echo ""
+    
+    # Discover shards
+    echo "Discovering backup shards..."
+    local shard_files=($(rclone lsf "${remote_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" | sort))
+    
+    if [[ ${#shard_files[@]} -eq 0 ]]; then
+        echo "ERROR: No shards found for backup prefix: ${backup_prefix}"
+        echo ""
+        echo "Available backups for ${source_dataset}:"
+        rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || echo "No backups found"
+        exit 1
+    fi
+    
+    echo "Found ${#shard_files[@]} shards: ${shard_files[0]} ... ${shard_files[-1]}"
+    
+    # Connection test
+    echo "Testing connection to $provider_name..."
+    if ! rclone lsd "${selected_remote%:*}:" >/dev/null 2>&1; then
+        echo "ERROR: Cannot connect to $provider_name"
+        exit 1
+    fi
+    echo "✓ Connected to $provider_name"
+    
+    # Target dataset validation
+    if zfs list "$target_dataset" >/dev/null 2>&1; then
+        # Check if it's a pool or dataset
+        local target_type=$(zfs get -H -o value type "$target_dataset" 2>/dev/null)
+        
+        if [[ "$target_type" == "filesystem" ]]; then
+            echo "WARNING: Target dataset $target_dataset already exists"
+            
+            # Check if running in background (no TTY)
+            if [[ ! -t 0 ]]; then
+                echo "ERROR: Cannot prompt for confirmation when running in background"
+                echo "Target dataset already exists. Use --as to specify a different target name"
+                exit 1
+            fi
+            
+            read -p "Do you want to destroy and recreate it? (y/N): " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                echo "Restore cancelled"
+                echo "Suggestion: Use --as to specify a different target name"
+                exit 1
+            fi
+            echo "Destroying existing dataset..."
+            zfs destroy -r "$target_dataset"
+        else
+            echo "ERROR: Target $target_dataset exists but is not a filesystem"
+            echo "Type: $target_type"
+            echo "Use --as to specify a different target name"
+            exit 1
+        fi
+    else
+        # Check if parent exists for dataset creation
+        local parent_dataset=$(dirname "$target_dataset" | sed 's|/.*||' | head -1)
+        local dataset_path=$(echo "$target_dataset" | sed 's|^[^/]*/||')
+        
+        # If target contains '/', check parent exists
+        if [[ "$target_dataset" =~ / ]]; then
+            local parent_path=$(echo "$target_dataset" | sed 's|/[^/]*$||')
+            if ! zfs list "$parent_path" >/dev/null 2>&1; then
+                echo "ERROR: Parent dataset $parent_path does not exist"
+                echo "Create parent first or use --as with an existing parent"
+                exit 1
+            fi
+        fi
+    fi
+    
+    # Restore process
+    local work_dir="${TEMP_DIR}/offsite-restore-$(date +%s)"
+    mkdir -p "$work_dir"
+    cd "$work_dir"
+    
+    echo ""
+    echo "Starting restore process..."
+    echo "Working directory: $work_dir"
+    
+    # Ensure target dataset mountpoint exists
+    echo "Preparing target dataset: $target_dataset"
+    
+    # Get the expected mountpoint for the target dataset
+    local mountpoint
+    if zfs list -H -o mountpoint "$target_dataset" 2>/dev/null; then
+        # Dataset exists, get its mountpoint
+        mountpoint=$(zfs list -H -o mountpoint "$target_dataset" 2>/dev/null)
+        echo "  Target dataset already exists with mountpoint: $mountpoint"
+    else
+        # Dataset doesn't exist, predict the mountpoint
+        # ZFS typically inherits from parent or uses /<pool>/<dataset>
+        local pool_name="${target_dataset%%/*}"
+        local dataset_path="${target_dataset#*/}"
+        
+        # Check if pool exists and get its mountpoint
+        if zfs list -H -o mountpoint "$pool_name" 2>/dev/null; then
+            local pool_mountpoint=$(zfs list -H -o mountpoint "$pool_name" 2>/dev/null)
+            if [[ "$pool_mountpoint" == "none" ]] || [[ "$pool_mountpoint" == "-" ]]; then
+                # Pool has no mountpoint, use standard ZFS path
+                mountpoint="/$target_dataset"
+            else
+                # Pool has mountpoint, build path from it
+                if [[ -n "$dataset_path" ]]; then
+                    mountpoint="$pool_mountpoint/$dataset_path"
+                else
+                    mountpoint="$pool_mountpoint"
+                fi
+            fi
+        else
+            echo "ERROR: ZFS pool '$pool_name' not found"
+            exit 1
+        fi
+        
+        echo "  Target dataset will be created with mountpoint: $mountpoint"
+    fi
+    
+    # Create mountpoint directory if it doesn't exist
+    if [[ "$mountpoint" != "none" ]] && [[ "$mountpoint" != "-" ]] && [[ ! -d "$mountpoint" ]]; then
+        echo "  Creating mountpoint directory: $mountpoint"
+        if sudo mkdir -p "$mountpoint"; then
+            echo "  ✓ Mountpoint created successfully"
+        else
+            echo "  ✗ Failed to create mountpoint directory"
+            exit 1
+        fi
+    fi
+    
+    # Stream to ZFS receive with individual progress bars and pipeline buffer
+    echo "Step 1: Streaming ${#shard_files[@]} shards to ZFS receive..."
+    echo ""
+    
+    # Sort shards by byte offset to ensure correct order
+    local sorted_shards=()
+    for shard_file in "${shard_files[@]}"; do
+        local offset=$(echo "$shard_file" | sed 's/.*-s[0-9][0-9][0-9]-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
+        sorted_shards+=("$offset:$shard_file")
+    done
+    
+    # Sort by byte offset (numeric sort on the offset part)
+    IFS=$'\n' sorted_shards=($(sort -t: -k1,1n <<< "${sorted_shards[*]}"))
+    
+    echo "  Streaming ${#sorted_shards[@]} shards with individual progress bars..."
+    echo ""
+    
+    local total_shards=${#sorted_shards[@]}
+    
+    # Stream shards directly to ZFS receive - proven working approach
+    {
+        for entry in "${sorted_shards[@]}"; do
+            local shard_file="${entry#*:}"
+            echo "    Processing: $shard_file" >&2
+            
+            # Stream: download → decrypt → decompress
+            rclone cat "${remote_path}/${shard_file}" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip
+        done
+    } | zfs recv -F "$target_dataset"
+    
+    local zfs_recv_result=$?
+    
+    if [[ $zfs_recv_result -eq 0 ]]; then
+        echo "  ✓ ZFS receive completed successfully"
+    else
+        echo "  ✗ ZFS receive failed with exit code: $zfs_recv_result"
+        return $zfs_recv_result
+    fi
+    
+    # Cleanup
+    cd /
+    rm -rf "$work_dir"
+    
+    echo ""
+    echo "✅ Restore complete!"
+    echo ""
+    echo "Source: $source_dataset ($backup_prefix)"
+    echo "Target: $target_dataset"
+    echo "Shards processed: ${#shard_files[@]}"
+    echo "Provider: $provider_name"
+    echo ""
+    echo "You can now:"
+    echo "  - Mount: zfs mount $target_dataset"
+    echo "  - List snapshots: zfs list -t snapshot -r $target_dataset"
+    echo "  - Access data at: $(zfs get -H -o value mountpoint $target_dataset 2>/dev/null || echo 'mount point')"
+}
+
+# === END RESTORE FUNCTIONS ===
+
+# === LIST FUNCTIONS ===
+
+run_list() {
+    local dataset_arg="$1"
+    local provider="${2:-all}"
+    
+    echo "=== Offsite Backup List ==="
+    echo ""
+    
+    # Provider selection (same logic as backup)
+    if [[ "$provider" == "all" ]]; then
+        SELECTED_PROVIDERS=($(printf '%s\n' "${!PROVIDERS[@]}" | sort))
+    else
+        case "$provider" in
+            bb) provider="backblaze" ;;
+            scw) provider="scaleway" ;;
+        esac
+        
+        if [[ -z "${PROVIDERS[$provider]:-}" ]]; then
+            echo "ERROR: Unknown provider '$provider'"
+            echo "Available providers: ${\!PROVIDERS[*]}"
+            exit 1
+        fi
+        
+        SELECTED_PROVIDERS=("$provider")
+    fi
+    
+    # List backups for each provider
+    for prov in "${SELECTED_PROVIDERS[@]}"; do
+        rclone_remote="${PROVIDERS[$prov]}"
+        provider_name="${PROVIDER_NAMES[$prov]}"
+        
+        echo "📡 $provider_name ($prov)"
+        echo "─────────────────────────────────────"
+        
+        if [[ -n "$dataset_arg" ]]; then
+            # List specific dataset
+            list_dataset_backups "$rclone_remote" "$dataset_arg"
+        else
+            # List all datasets
+            list_all_backups "$rclone_remote"
+        fi
+        
+        echo ""
+    done
+}
+
+list_dataset_backups() {
+    local rclone_remote="$1"
+    local dataset="$2"
+    local dataset_path="${dataset//\//_}"
+    
+    # Get all backup prefixes for this dataset (new byte offset format)
+    local backup_files=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep -E "^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$" | sort || true))
+    
+    if [[ ${#backup_files[@]} -eq 0 ]]; then
+        echo "  No backups found for $dataset"
+        return
+    fi
+    
+    # Extract unique backup prefixes (remove shard suffix from new format)
+    local backup_prefixes=($(printf '%s\n' "${backup_files[@]}" | sed -E 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u))
+    
+    echo "  Dataset: $dataset"
+    echo ""
+    
+    for prefix in "${backup_prefixes[@]}"; do
+        # Count shards for this backup (new byte offset format)
+        local shard_count=$(printf '%s\n' "${backup_files[@]}" | grep "^${prefix}-s[0-9][0-9][0-9]-b" | wc -l)
+        
+        # Check if backup is complete (simplified for now)
+        local status="❌ Incomplete" 
+        # TODO: Re-enable completion check when function scope issue is resolved
+        # if is_backup_complete "$rclone_remote" "$dataset_path" "$prefix"; then
+        #     status="✅ Complete"
+        # fi
+        
+        # Display backup info (new format is dataset:snapshot)
+        echo "    $status $prefix ($shard_count shards)"
+    done
+}
+
+list_all_backups() {
+    local rclone_remote="$1"
+    
+    # Get all dataset directories
+    local datasets=($(rclone lsd "${rclone_remote}/" 2>/dev/null | awk '{print $NF}' | grep -v "^$" || true))
+    
+    if [[ ${#datasets[@]} -eq 0 ]]; then
+        echo "  No backups found"
+        return
+    fi
+    
+    for dataset_path in "${datasets[@]}"; do
+        # Convert path back to dataset name
+        local dataset="${dataset_path//_//}"
+        list_dataset_backups "$rclone_remote" "$dataset"
+        echo ""
+    done
+}
+
+# === END LIST FUNCTIONS ===
+ | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || true))
+        
+        if [[ ${#all_backups[@]} -eq 0 ]]; then
+            echo "ERROR: No backups found for dataset $source_dataset"
+            exit 1
+        fi
+        
+        if [[ "$backup_prefix" == "latest-full" ]]; then
+            # In new format, all backups are "full" - just get the latest
+            backup_prefix="${all_backups[-1]}"
+            echo "Selected latest backup: $backup_prefix"
+        else
+            # Find latest backup
+            backup_prefix="${all_backups[-1]}"
+            echo "Selected latest backup: $backup_prefix"
+        fi
+        
+        echo "Available backups for $source_dataset:"
+        printf '%s\n' "${all_backups[@]}" | tail -5
+        echo ""
+    else
+        # User specified a specific backup - need to find the actual backup prefix
+        echo "Searching for backup matching: $backup_prefix"
+        
+        # Get all backup prefixes for this dataset (new byte offset format)
+        local all_backups=($(rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age
+        
+        if [[ ${#all_backups[@]} -eq 0 ]]; then
+            echo "ERROR: No backups found for dataset $source_dataset"
+            exit 1
+        fi
+        
+        # Look for backup that matches the specified snapshot name
+        local found_backup=""
+        for backup in "${all_backups[@]}"; do
+            if [[ "$backup" == "${source_dataset//\//_}:${backup_prefix}" ]]; then
+                found_backup="$backup"
+                break
+            fi
+        done
+        
+        if [[ -z "$found_backup" ]]; then
+            echo "ERROR: No backup found matching snapshot: $backup_prefix"
+            echo "Available backups:"
+            printf '%s\n' "${all_backups[@]}"
+            exit 1
+        fi
+        
+        backup_prefix="$found_backup"
+        echo "Found matching backup: $backup_prefix"
+    fi
+    
+    echo "Final backup selection: $backup_prefix"
+    echo ""
+    
+    # Discover shards
+    echo "Discovering backup shards..."
+    local shard_files=($(rclone lsf "${remote_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" | sort))
+    
+    if [[ ${#shard_files[@]} -eq 0 ]]; then
+        echo "ERROR: No shards found for backup prefix: ${backup_prefix}"
+        echo ""
+        echo "Available backups for ${source_dataset}:"
+        rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || echo "No backups found"
+        exit 1
+    fi
+    
+    echo "Found ${#shard_files[@]} shards: ${shard_files[0]} ... ${shard_files[-1]}"
+    
+    # Connection test
+    echo "Testing connection to $provider_name..."
+    if ! rclone lsd "${selected_remote%:*}:" >/dev/null 2>&1; then
+        echo "ERROR: Cannot connect to $provider_name"
+        exit 1
+    fi
+    echo "✓ Connected to $provider_name"
+    
+    # Target dataset validation
+    if zfs list "$target_dataset" >/dev/null 2>&1; then
+        # Check if it's a pool or dataset
+        local target_type=$(zfs get -H -o value type "$target_dataset" 2>/dev/null)
+        
+        if [[ "$target_type" == "filesystem" ]]; then
+            echo "WARNING: Target dataset $target_dataset already exists"
+            
+            # Check if running in background (no TTY)
+            if [[ ! -t 0 ]]; then
+                echo "ERROR: Cannot prompt for confirmation when running in background"
+                echo "Target dataset already exists. Use --as to specify a different target name"
+                exit 1
+            fi
+            
+            read -p "Do you want to destroy and recreate it? (y/N): " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                echo "Restore cancelled"
+                echo "Suggestion: Use --as to specify a different target name"
+                exit 1
+            fi
+            echo "Destroying existing dataset..."
+            zfs destroy -r "$target_dataset"
+        else
+            echo "ERROR: Target $target_dataset exists but is not a filesystem"
+            echo "Type: $target_type"
+            echo "Use --as to specify a different target name"
+            exit 1
+        fi
+    else
+        # Check if parent exists for dataset creation
+        local parent_dataset=$(dirname "$target_dataset" | sed 's|/.*||' | head -1)
+        local dataset_path=$(echo "$target_dataset" | sed 's|^[^/]*/||')
+        
+        # If target contains '/', check parent exists
+        if [[ "$target_dataset" =~ / ]]; then
+            local parent_path=$(echo "$target_dataset" | sed 's|/[^/]*$||')
+            if ! zfs list "$parent_path" >/dev/null 2>&1; then
+                echo "ERROR: Parent dataset $parent_path does not exist"
+                echo "Create parent first or use --as with an existing parent"
+                exit 1
+            fi
+        fi
+    fi
+    
+    # Restore process
+    local work_dir="${TEMP_DIR}/offsite-restore-$(date +%s)"
+    mkdir -p "$work_dir"
+    cd "$work_dir"
+    
+    echo ""
+    echo "Starting restore process..."
+    echo "Working directory: $work_dir"
+    
+    # Ensure target dataset mountpoint exists
+    echo "Preparing target dataset: $target_dataset"
+    
+    # Get the expected mountpoint for the target dataset
+    local mountpoint
+    if zfs list -H -o mountpoint "$target_dataset" 2>/dev/null; then
+        # Dataset exists, get its mountpoint
+        mountpoint=$(zfs list -H -o mountpoint "$target_dataset" 2>/dev/null)
+        echo "  Target dataset already exists with mountpoint: $mountpoint"
+    else
+        # Dataset doesn't exist, predict the mountpoint
+        # ZFS typically inherits from parent or uses /<pool>/<dataset>
+        local pool_name="${target_dataset%%/*}"
+        local dataset_path="${target_dataset#*/}"
+        
+        # Check if pool exists and get its mountpoint
+        if zfs list -H -o mountpoint "$pool_name" 2>/dev/null; then
+            local pool_mountpoint=$(zfs list -H -o mountpoint "$pool_name" 2>/dev/null)
+            if [[ "$pool_mountpoint" == "none" ]] || [[ "$pool_mountpoint" == "-" ]]; then
+                # Pool has no mountpoint, use standard ZFS path
+                mountpoint="/$target_dataset"
+            else
+                # Pool has mountpoint, build path from it
+                if [[ -n "$dataset_path" ]]; then
+                    mountpoint="$pool_mountpoint/$dataset_path"
+                else
+                    mountpoint="$pool_mountpoint"
+                fi
+            fi
+        else
+            echo "ERROR: ZFS pool '$pool_name' not found"
+            exit 1
+        fi
+        
+        echo "  Target dataset will be created with mountpoint: $mountpoint"
+    fi
+    
+    # Create mountpoint directory if it doesn't exist
+    if [[ "$mountpoint" != "none" ]] && [[ "$mountpoint" != "-" ]] && [[ ! -d "$mountpoint" ]]; then
+        echo "  Creating mountpoint directory: $mountpoint"
+        if sudo mkdir -p "$mountpoint"; then
+            echo "  ✓ Mountpoint created successfully"
+        else
+            echo "  ✗ Failed to create mountpoint directory"
+            exit 1
+        fi
+    fi
+    
+    # Stream to ZFS receive with individual progress bars and pipeline buffer
+    echo "Step 1: Streaming ${#shard_files[@]} shards to ZFS receive..."
+    echo ""
+    
+    # Sort shards by byte offset to ensure correct order
+    local sorted_shards=()
+    for shard_file in "${shard_files[@]}"; do
+        local offset=$(echo "$shard_file" | sed 's/.*-s[0-9][0-9][0-9]-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
+        sorted_shards+=("$offset:$shard_file")
+    done
+    
+    # Sort by byte offset (numeric sort on the offset part)
+    IFS=$'\n' sorted_shards=($(sort -t: -k1,1n <<< "${sorted_shards[*]}"))
+    
+    echo "  Streaming ${#sorted_shards[@]} shards with individual progress bars..."
+    echo ""
+    
+    local total_shards=${#sorted_shards[@]}
+    
+    # Stream shards directly to ZFS receive - proven working approach
+    {
+        for entry in "${sorted_shards[@]}"; do
+            local shard_file="${entry#*:}"
+            echo "    Processing: $shard_file" >&2
+            
+            # Stream: download → decrypt → decompress
+            rclone cat "${remote_path}/${shard_file}" | age -d -i "$AGE_PRIVATE_KEY_FILE" | gunzip
+        done
+    } | zfs recv -F "$target_dataset"
+    
+    local zfs_recv_result=$?
+    
+    if [[ $zfs_recv_result -eq 0 ]]; then
+        echo "  ✓ ZFS receive completed successfully"
+    else
+        echo "  ✗ ZFS receive failed with exit code: $zfs_recv_result"
+        return $zfs_recv_result
+    fi
+    
+    # Cleanup
+    cd /
+    rm -rf "$work_dir"
+    
+    echo ""
+    echo "✅ Restore complete!"
+    echo ""
+    echo "Source: $source_dataset ($backup_prefix)"
+    echo "Target: $target_dataset"
+    echo "Shards processed: ${#shard_files[@]}"
+    echo "Provider: $provider_name"
+    echo ""
+    echo "You can now:"
+    echo "  - Mount: zfs mount $target_dataset"
+    echo "  - List snapshots: zfs list -t snapshot -r $target_dataset"
+    echo "  - Access data at: $(zfs get -H -o value mountpoint $target_dataset 2>/dev/null || echo 'mount point')"
+}
+
+# === END RESTORE FUNCTIONS ===
+
+# === LIST FUNCTIONS ===
+
+run_list() {
+    local dataset_arg="$1"
+    local provider="${2:-all}"
+    
+    echo "=== Offsite Backup List ==="
+    echo ""
+    
+    # Provider selection (same logic as backup)
+    if [[ "$provider" == "all" ]]; then
+        SELECTED_PROVIDERS=($(printf '%s\n' "${!PROVIDERS[@]}" | sort))
+    else
+        case "$provider" in
+            bb) provider="backblaze" ;;
+            scw) provider="scaleway" ;;
+        esac
+        
+        if [[ -z "${PROVIDERS[$provider]:-}" ]]; then
+            echo "ERROR: Unknown provider '$provider'"
+            echo "Available providers: ${\!PROVIDERS[*]}"
+            exit 1
+        fi
+        
+        SELECTED_PROVIDERS=("$provider")
+    fi
+    
+    # List backups for each provider
+    for prov in "${SELECTED_PROVIDERS[@]}"; do
+        rclone_remote="${PROVIDERS[$prov]}"
+        provider_name="${PROVIDER_NAMES[$prov]}"
+        
+        echo "📡 $provider_name ($prov)"
+        echo "─────────────────────────────────────"
+        
+        if [[ -n "$dataset_arg" ]]; then
+            # List specific dataset
+            list_dataset_backups "$rclone_remote" "$dataset_arg"
+        else
+            # List all datasets
+            list_all_backups "$rclone_remote"
+        fi
+        
+        echo ""
+    done
+}
+
+list_dataset_backups() {
+    local rclone_remote="$1"
+    local dataset="$2"
+    local dataset_path="${dataset//\//_}"
+    
+    # Get all backup prefixes for this dataset (new byte offset format)
+    local backup_files=($(rclone lsf "${rclone_remote}/${dataset_path}/" 2>/dev/null | grep -E "^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$" | sort || true))
+    
+    if [[ ${#backup_files[@]} -eq 0 ]]; then
+        echo "  No backups found for $dataset"
+        return
+    fi
+    
+    # Extract unique backup prefixes (remove shard suffix from new format)
+    local backup_prefixes=($(printf '%s\n' "${backup_files[@]}" | sed -E 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u))
+    
+    echo "  Dataset: $dataset"
+    echo ""
+    
+    for prefix in "${backup_prefixes[@]}"; do
+        # Count shards for this backup (new byte offset format)
+        local shard_count=$(printf '%s\n' "${backup_files[@]}" | grep "^${prefix}-s[0-9][0-9][0-9]-b" | wc -l)
+        
+        # Check if backup is complete (simplified for now)
+        local status="❌ Incomplete" 
+        # TODO: Re-enable completion check when function scope issue is resolved
+        # if is_backup_complete "$rclone_remote" "$dataset_path" "$prefix"; then
+        #     status="✅ Complete"
+        # fi
+        
+        # Display backup info (new format is dataset:snapshot)
+        echo "    $status $prefix ($shard_count shards)"
+    done
+}
+
+list_all_backups() {
+    local rclone_remote="$1"
+    
+    # Get all dataset directories
+    local datasets=($(rclone lsd "${rclone_remote}/" 2>/dev/null | awk '{print $NF}' | grep -v "^$" || true))
+    
+    if [[ ${#datasets[@]} -eq 0 ]]; then
+        echo "  No backups found"
+        return
+    fi
+    
+    for dataset_path in "${datasets[@]}"; do
+        # Convert path back to dataset name
+        local dataset="${dataset_path//_//}"
+        list_dataset_backups "$rclone_remote" "$dataset"
+        echo ""
+    done
+}
+
+# === END LIST FUNCTIONS ===
+ | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || true))
+        
+        if [[ ${#all_backups[@]} -eq 0 ]]; then
+            echo "ERROR: No backups found for dataset $source_dataset"
+            exit 1
+        fi
+        
+        # Look for backup that matches the specified snapshot name
+        local found_backup=""
+        for backup in "${all_backups[@]}"; do
+            if [[ "$backup" == "${source_dataset//\//_}:${backup_prefix}" ]]; then
+                found_backup="$backup"
+                break
+            fi
+        done
+        
+        if [[ -z "$found_backup" ]]; then
+            echo "ERROR: No backup found matching snapshot: $backup_prefix"
+            echo "Available backups:"
+            printf '%s\n' "${all_backups[@]}"
+            exit 1
+        fi
+        
+        backup_prefix="$found_backup"
+        echo "Found matching backup: $backup_prefix"
+    fi
+    
+    echo "Final backup selection: $backup_prefix"
+    echo ""
+    
+    # Discover shards
+    echo "Discovering backup shards..."
+    local shard_files=($(rclone lsf "${remote_path}/" 2>/dev/null | grep "^${backup_prefix}-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].zfs.gz.age$" | sort))
+    
+    if [[ ${#shard_files[@]} -eq 0 ]]; then
+        echo "ERROR: No shards found for backup prefix: ${backup_prefix}"
+        echo ""
+        echo "Available backups for ${source_dataset}:"
+        rclone lsf "${remote_path}/" 2>/dev/null | grep -E '^.*-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$' | sed 's/-s[0-9][0-9][0-9]-b[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.zfs\.gz\.age$//' | sort -u || echo "No backups found"
+        exit 1
+    fi
+    
+    echo "Found ${#shard_files[@]} shards: ${shard_files[0]} ... ${shard_files[-1]}"
+    
+    # Connection test
+    echo "Testing connection to $provider_name..."
+    if ! rclone lsd "${selected_remote%:*}:" >/dev/null 2>&1; then
+        echo "ERROR: Cannot connect to $provider_name"
+        exit 1
+    fi
+    echo "✓ Connected to $provider_name"
+    
+    # Target dataset validation
+    if zfs list "$target_dataset" >/dev/null 2>&1; then
+        # Check if it's a pool or dataset
+        local target_type=$(zfs get -H -o value type "$target_dataset" 2>/dev/null)
+        
+        if [[ "$target_type" == "filesystem" ]]; then
+            echo "WARNING: Target dataset $target_dataset already exists"
+            
+            # Check if running in background (no TTY)
+            if [[ ! -t 0 ]]; then
+                echo "ERROR: Cannot prompt for confirmation when running in background"
+                echo "Target dataset already exists. Use --as to specify a different target name"
+                exit 1
+            fi
+            
+            read -p "Do you want to destroy and recreate it? (y/N): " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                echo "Restore cancelled"
+                echo "Suggestion: Use --as to specify a different target name"
+                exit 1
+            fi
+            echo "Destroying existing dataset..."
+            zfs destroy -r "$target_dataset"
+        else
+            echo "ERROR: Target $target_dataset exists but is not a filesystem"
+            echo "Type: $target_type"
+            echo "Use --as to specify a different target name"
+            exit 1
+        fi
+    else
+        # Check if parent exists for dataset creation
+        local parent_dataset=$(dirname "$target_dataset" | sed 's|/.*||' | head -1)
+        local dataset_path=$(echo "$target_dataset" | sed 's|^[^/]*/||')
+        
+        # If target contains '/', check parent exists
+        if [[ "$target_dataset" =~ / ]]; then
+            local parent_path=$(echo "$target_dataset" | sed 's|/[^/]*$||')
+            if ! zfs list "$parent_path" >/dev/null 2>&1; then
+                echo "ERROR: Parent dataset $parent_path does not exist"
+                echo "Create parent first or use --as with an existing parent"
+                exit 1
+            fi
+        fi
+    fi
+    
+    # Restore process
+    local work_dir="${TEMP_DIR}/offsite-restore-$(date +%s)"
+    mkdir -p "$work_dir"
+    cd "$work_dir"
+    
+    echo ""
+    echo "Starting restore process..."
+    echo "Working directory: $work_dir"
+    
+    # Ensure target dataset mountpoint exists
+    echo "Preparing target dataset: $target_dataset"
+    
+    # Get the expected mountpoint for the target dataset
+    local mountpoint
+    if zfs list -H -o mountpoint "$target_dataset" 2>/dev/null; then
+        # Dataset exists, get its mountpoint
+        mountpoint=$(zfs list -H -o mountpoint "$target_dataset" 2>/dev/null)
+        echo "  Target dataset already exists with mountpoint: $mountpoint"
+    else
+        # Dataset doesn't exist, predict the mountpoint
+        # ZFS typically inherits from parent or uses /<pool>/<dataset>
+        local pool_name="${target_dataset%%/*}"
+        local dataset_path="${target_dataset#*/}"
+        
+        # Check if pool exists and get its mountpoint
+        if zfs list -H -o mountpoint "$pool_name" 2>/dev/null; then
+            local pool_mountpoint=$(zfs list -H -o mountpoint "$pool_name" 2>/dev/null)
+            if [[ "$pool_mountpoint" == "none" ]] || [[ "$pool_mountpoint" == "-" ]]; then
+                # Pool has no mountpoint, use standard ZFS path
+                mountpoint="/$target_dataset"
+            else
+                # Pool has mountpoint, build path from it
+                if [[ -n "$dataset_path" ]]; then
+                    mountpoint="$pool_mountpoint/$dataset_path"
+                else
+                    mountpoint="$pool_mountpoint"
+                fi
+            fi
+        else
+            echo "ERROR: ZFS pool '$pool_name' not found"
+            exit 1
+        fi
+        
+        echo "  Target dataset will be created with mountpoint: $mountpoint"
+    fi
+    
+    # Create mountpoint directory if it doesn't exist
+    if [[ "$mountpoint" != "none" ]] && [[ "$mountpoint" != "-" ]] && [[ ! -d "$mountpoint" ]]; then
+        echo "  Creating mountpoint directory: $mountpoint"
+        if sudo mkdir -p "$mountpoint"; then
+            echo "  ✓ Mountpoint created successfully"
+        else
+            echo "  ✗ Failed to create mountpoint directory"
+            exit 1
+        fi
+    fi
+    
+    # Stream to ZFS receive with individual progress bars and pipeline buffer
+    echo "Step 1: Streaming ${#shard_files[@]} shards to ZFS receive..."
+    echo ""
+    
+    # Sort shards by byte offset to ensure correct order
+    local sorted_shards=()
+    for shard_file in "${shard_files[@]}"; do
+        local offset=$(echo "$shard_file" | sed 's/.*-s[0-9][0-9][0-9]-b\([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\)\.zfs\.gz\.age$/\1/')
         sorted_shards+=("$offset:$shard_file")
     done
     
